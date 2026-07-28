@@ -124,6 +124,7 @@ class IMDFBuilder {
         
         // Upload floor plan
         document.getElementById('uploadBtn').addEventListener('click', () => this.uploadFloorplan());
+        document.getElementById('autoTraceBtn').addEventListener('click', () => this.autoTraceRooms());
         
         // Level management
         document.getElementById('addLevelBtn').addEventListener('click', () => this.addLevel());
@@ -620,6 +621,159 @@ class IMDFBuilder {
 
         this.renderLevelsList();
         this.updateCounts();
+    }
+
+    // Detect enclosed rooms on the uploaded floor plan and add an editable
+    // unit box for each. Pure pixel work: binarize, swallow hair-thin
+    // furniture lines, flood away everything connected to the image border,
+    // then take each remaining connected open region as a room candidate.
+    autoTraceRooms() {
+        if (!this.currentLevel) {
+            alert('Please add and select a level first');
+            return;
+        }
+        const bg = this.canvas.backgroundImage;
+        if (!bg) {
+            alert('Upload a floor plan first — auto-trace scans the background image.');
+            return;
+        }
+        const el = bg.getElement ? bg.getElement() : bg._element;
+        const iw = el.naturalWidth || el.width;
+        const ih = el.naturalHeight || el.height;
+        const maxDim = 900;
+        const s = Math.min(1, maxDim / Math.max(iw, ih));
+        const w = Math.max(1, Math.round(iw * s));
+        const h = Math.max(1, Math.round(ih * s));
+
+        const off = document.createElement('canvas');
+        off.width = w;
+        off.height = h;
+        const ctx = off.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(el, 0, 0, w, h);
+        const px = ctx.getImageData(0, 0, w, h).data;
+
+        // 1 = open space (light or transparent), 0 = ink (walls, lines)
+        let open = new Uint8Array(w * h);
+        for (let i = 0; i < w * h; i++) {
+            const lum = px[i * 4 + 3] < 40
+                ? 255
+                : 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
+            open[i] = lum > 180 ? 1 : 0;
+        }
+
+        // Close 1px-wide lines (furniture symbols) so a room stays one region;
+        // real walls are thicker and survive. Two passes handle diagonals.
+        for (let pass = 0; pass < 2; pass++) {
+            const closed = new Uint8Array(open);
+            for (let y = 1; y < h - 1; y++) {
+                for (let x = 1; x < w - 1; x++) {
+                    const i = y * w + x;
+                    if (!open[i] && ((open[i - 1] && open[i + 1]) || (open[i - w] && open[i + w]))) {
+                        closed[i] = 1;
+                    }
+                }
+            }
+            open = closed;
+        }
+
+        // Flood from the borders: everything reachable is outside the building.
+        const label = new Int32Array(w * h);
+        const stack = [];
+        for (let x = 0; x < w; x++) stack.push(x, (h - 1) * w + x);
+        for (let y = 0; y < h; y++) stack.push(y * w, y * w + w - 1);
+        const flood = (seedLabel, collect) => {
+            let minX = w, minY = h, maxX = 0, maxY = 0, count = 0;
+            while (stack.length) {
+                const i = stack.pop();
+                if (i < 0 || i >= w * h || label[i] !== 0 || !open[i]) continue;
+                label[i] = seedLabel;
+                count++;
+                const x = i % w;
+                if (collect) {
+                    const y = (i / w) | 0;
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
+                }
+                if (x > 0) stack.push(i - 1);
+                if (x < w - 1) stack.push(i + 1);
+                stack.push(i - w, i + w);
+            }
+            return { minX, minY, maxX, maxY, count };
+        };
+        flood(-1, false);
+
+        // Remaining open regions are enclosed spaces: room candidates.
+        const regions = [];
+        let nextLabel = 1;
+        for (let start = 0; start < w * h; start++) {
+            if (label[start] === 0 && open[start]) {
+                stack.push(start);
+                regions.push(flood(nextLabel++, true));
+            }
+        }
+
+        // Map detected image pixels back onto canvas coordinates. The floor
+        // plan is drawn centred (originX/Y "center") and scaled.
+        const bgScaleX = bg.scaleX || 1;
+        const bgScaleY = bg.scaleY || 1;
+        const toCanvasX = (imgX) => bg.left - (iw * bgScaleX) / 2 + (imgX / s) * bgScaleX;
+        const toCanvasY = (imgY) => bg.top - (ih * bgScaleY) / 2 + (imgY / s) * bgScaleY;
+        const coveredByExisting = (cx, cy) => this.units.some(u => {
+            const o = u.fabricObject;
+            return o && cx >= o.left && cx <= o.left + o.width * o.scaleX
+                     && cy >= o.top && cy <= o.top + o.height * o.scaleY;
+        });
+
+        const imgArea = w * h;
+        let added = 0;
+        let skipped = 0;
+        for (const r of regions.sort((a, b) => b.count - a.count)) {
+            if (added >= 80) break;
+            const bw = r.maxX - r.minX + 1;
+            const bh = r.maxY - r.minY + 1;
+            const areaFraction = r.count / imgArea;
+            if (areaFraction < 0.0015 || areaFraction > 0.35) continue; // noise / whole floor
+            if (r.count / (bw * bh) < 0.55) { skipped++; continue; }    // corridors, L-shapes
+            const left = toCanvasX(r.minX);
+            const top = toCanvasY(r.minY);
+            const width = toCanvasX(r.maxX + 1) - left;
+            const height = toCanvasY(r.maxY + 1) - top;
+            if (coveredByExisting(left + width / 2, top + height / 2)) continue;
+
+            const rect = new fabric.Rect({
+                left, top, width, height,
+                fill: 'rgba(0, 120, 212, 0.3)',
+                stroke: '#0078d4',
+                strokeWidth: 2
+            });
+            const unit = {
+                id: this.generateUUID(),
+                name: `Room ${this.units.length + 1}`,
+                featureType: 'unit',
+                category: 'room',
+                restriction: null,
+                placeId: null,
+                levelId: this.currentLevel.id,
+                fabricObject: rect
+            };
+            rect.imdfData = unit;
+            this.units.push(unit);
+            this.canvas.add(rect);
+            added++;
+        }
+
+        this.canvas.renderAll();
+        this.updateCounts();
+        if (added === 0) {
+            alert('No enclosed rooms were detected' + (skipped ? ` (${skipped} irregular region(s) skipped)` : '') +
+                  '. Rooms already covered by existing boxes are left alone; otherwise try drawing manually.');
+        } else {
+            alert(`Auto-trace added ${added} box(es).` +
+                  (skipped ? ` ${skipped} irregular region(s) (corridors / L-shapes) were skipped — draw those by hand.` : '') +
+                  ' Move, resize, rename, or convert any box to a Section afterwards.');
+        }
     }
 
     async uploadFloorplan() {
