@@ -844,14 +844,9 @@ class IMDFBuilder {
             if (data.units) {
                 data.units.forEach(unitData => {
                     const isSection = unitData.featureType === 'section';
-                    const rect = new fabric.Rect({
-                        left: 100,
-                        top: 100,
-                        width: 100,
-                        height: 100,
+                    const rect = this.rectFromSavedCoordinates(unitData.coordinates, {
                         fill: isSection ? 'rgba(255, 140, 0, 0.3)' : 'rgba(0, 120, 212, 0.3)',
-                        stroke: isSection ? '#ff8c00' : '#0078d4',
-                        strokeWidth: 2
+                        stroke: isSection ? '#ff8c00' : '#0078d4'
                     });
                     unitData.fabricObject = rect;
                     rect.imdfData = unitData;
@@ -863,9 +858,10 @@ class IMDFBuilder {
             // Load amenities
             if (data.amenities) {
                 data.amenities.forEach(amenityData => {
+                    const pt = Array.isArray(amenityData.coordinates) ? amenityData.coordinates : [0.002, 0.002];
                     const circle = new fabric.Circle({
-                        left: 200,
-                        top: 200,
+                        left: pt[0] * 100000,
+                        top: pt[1] * 100000,
                         radius: 15,
                         fill: 'rgba(40, 167, 69, 0.5)',
                         stroke: '#28a745',
@@ -875,6 +871,27 @@ class IMDFBuilder {
                     circle.imdfData = amenityData;
                     this.amenities.push(amenityData);
                     this.canvas.add(circle);
+                });
+            }
+
+            // Load fixtures and openings — previously dropped on load, which
+            // silently deleted them from the project on the next save.
+            if (data.fixtures) {
+                data.fixtures.forEach(fixtureData => {
+                    const line = this.lineFromSavedCoordinates(fixtureData.coordinates, { stroke: '#6c757d', strokeWidth: 3 });
+                    fixtureData.fabricObject = line;
+                    line.imdfData = fixtureData;
+                    this.fixtures.push(fixtureData);
+                    this.canvas.add(line);
+                });
+            }
+            if (data.openings) {
+                data.openings.forEach(openingData => {
+                    const line = this.lineFromSavedCoordinates(openingData.coordinates, { stroke: '#dc3545', strokeWidth: 4 });
+                    openingData.fabricObject = line;
+                    line.imdfData = openingData;
+                    this.openings.push(openingData);
+                    this.canvas.add(line);
                 });
             }
 
@@ -954,6 +971,33 @@ class IMDFBuilder {
         a.click();
         window.URL.revokeObjectURL(url);
         document.body.removeChild(a);
+    }
+
+    // Saved shapes store canvas pixels / 100000 (see getObjectCoordinates and
+    // friends); scale them back up so loading a project restores positions
+    // instead of piling everything at a default spot.
+    rectFromSavedCoordinates(coordinates, options) {
+        let left = 100, top = 100, width = 100, height = 100;
+        const ring = Array.isArray(coordinates) && coordinates[0];
+        if (ring && ring.length >= 4) {
+            const xs = ring.map(p => p[0] * 100000);
+            const ys = ring.map(p => p[1] * 100000);
+            left = Math.min(...xs);
+            top = Math.min(...ys);
+            width = Math.max(...xs) - left;
+            height = Math.max(...ys) - top;
+        }
+        return new fabric.Rect({ left, top, width, height, strokeWidth: 2, ...options });
+    }
+
+    lineFromSavedCoordinates(coordinates, options) {
+        const pts = Array.isArray(coordinates) && coordinates.length >= 2
+            ? coordinates
+            : [[0.001, 0.001], [0.0015, 0.001]];
+        return new fabric.Line(
+            [pts[0][0] * 100000, pts[0][1] * 100000, pts[1][0] * 100000, pts[1][1] * 100000],
+            options
+        );
     }
 
     // Users paste PlaceIds straight out of Get-PlaceV3 table output, often with
