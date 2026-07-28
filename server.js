@@ -304,8 +304,19 @@ function generateIMDFFiles(projectData) {
   const centerX = (minX + maxX) / 2;
   const centerY = (minY + maxY) / 2;
 
+  // Fit the drawing to the building's physical width. Canvas units carry no
+  // real-world size — mapped 1:1 onto degrees, a typical drawing becomes
+  // hundreds of metres wide, which wrecks Places' zoom range and renders
+  // rooms the size of city blocks. Same metres-per-unit on both axes keeps
+  // the aspect ratio.
+  const widthMeters = Number(building?.widthMeters) > 0 ? Number(building.widthMeters) : 50;
+  const metersPerUnit = widthMeters / Math.max(maxX - minX, 1e-9);
+  const latRadians = (origin ? origin.lat : 0) * Math.PI / 180;
+  const degLonPerUnit = metersPerUnit / (111320 * Math.cos(latRadians));
+  const degLatPerUnit = metersPerUnit / 110540;
+
   const projectPoint = ([x, y]) => (origin
-    ? [origin.lon + (x - centerX), origin.lat - (y - centerY)]
+    ? [origin.lon + (x - centerX) * degLonPerUnit, origin.lat - (y - centerY) * degLatPerUnit]
     : [x, y]);
   const projectPolygon = polygon => polygon.map((ring, i) => {
     const projected = ring.map(projectPoint);

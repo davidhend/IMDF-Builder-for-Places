@@ -11,3 +11,4 @@ imdf_correlated*.zip
 imdf_correlated*/
 mapfeatures.csv
 imdf-export/
+/*.png
