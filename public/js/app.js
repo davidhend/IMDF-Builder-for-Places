@@ -691,6 +691,7 @@ class IMDFBuilder {
                 footprintId: this.footprintId,
                 name: document.getElementById('buildingName').value || 'Building',
                 placeId: buildingPlaceId,
+                widthMeters: parseFloat(document.getElementById('buildingWidth').value) || null,
                 coordinates: this.getBuildingCoordinates()
             },
             levels: this.levels.map(l => ({
@@ -821,6 +822,7 @@ class IMDFBuilder {
             if (data.building) {
                 document.getElementById('buildingName').value = data.building.name;
                 document.getElementById('buildingPlaceId').value = data.building.placeId || '';
+                document.getElementById('buildingWidth').value = data.building.widthMeters || 50;
                 this.buildingId = data.building.id || null;
                 this.footprintId = data.building.footprintId || null;
             }
@@ -920,6 +922,7 @@ class IMDFBuilder {
             document.getElementById('projectName').value = '';
             document.getElementById('buildingName').value = '';
             document.getElementById('buildingPlaceId').value = '';
+            document.getElementById('buildingWidth').value = 50;
             document.getElementById('venueCoords').value = '0, 0';
             
             this.renderLevelsList();
