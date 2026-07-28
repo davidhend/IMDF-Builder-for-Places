@@ -384,7 +384,7 @@ class IMDFBuilder {
                 </div>
                 <div class="property-field">
                     <label>Microsoft Places ID (optional):</label>
-                    <input type="text" id="prop-placeid" value="${data.placeId || ''}" placeholder="${isSection ? 'Section' : 'Room'} PlaceId from Get-PlaceV3" />
+                    <input type="text" id="prop-placeid" value="${data.placeId || ''}" placeholder="${isSection ? 'Section PlaceId (not a Desk’s — desks locate via their Section)' : 'Room PlaceId from Get-PlaceV3'}" />
                 </div>
             `;
         }
@@ -412,7 +412,10 @@ class IMDFBuilder {
 
         if (nameInput) data.name = nameInput.value;
         if (categoryInput) data.category = categoryInput.value;
-        if (placeIdInput) data.placeId = placeIdInput.value.trim() || null;
+        if (placeIdInput) {
+            data.placeId = this.extractPlaceId(placeIdInput.value, 'Microsoft Places ID');
+            placeIdInput.value = data.placeId || '';
+        }
         if (featureTypeInput && featureTypeInput.value !== (data.featureType || 'unit')) {
             data.featureType = featureTypeInput.value;
             this.applyFeatureTypeStyle(data.fabricObject, data.featureType);
@@ -523,7 +526,8 @@ class IMDFBuilder {
                 level.ordinal = ordinal;
                 level.short_name = ordinal.toString();
             }
-            level.placeId = document.getElementById('level-prop-placeid').value.trim() || null;
+            level.placeId = this.extractPlaceId(document.getElementById('level-prop-placeid').value, 'Floor Places ID');
+            document.getElementById('level-prop-placeid').value = level.placeId || '';
             this.renderLevelsList();
             this.updateCanvasInfo(`Current Level: ${level.name}`);
             alert('Level updated!');
@@ -672,6 +676,10 @@ class IMDFBuilder {
         this.buildingId = this.buildingId || this.generateUUID();
         this.footprintId = this.footprintId || this.generateUUID();
 
+        const buildingPlaceIdInput = document.getElementById('buildingPlaceId');
+        const buildingPlaceId = this.extractPlaceId(buildingPlaceIdInput.value, 'Building Places ID');
+        buildingPlaceIdInput.value = buildingPlaceId || '';
+
         return {
             projectName: projectName,
             venue: {
@@ -682,7 +690,7 @@ class IMDFBuilder {
                 id: this.buildingId,
                 footprintId: this.footprintId,
                 name: document.getElementById('buildingName').value || 'Building',
-                placeId: document.getElementById('buildingPlaceId').value.trim() || null,
+                placeId: buildingPlaceId,
                 coordinates: this.getBuildingCoordinates()
             },
             levels: this.levels.map(l => ({
@@ -946,6 +954,20 @@ class IMDFBuilder {
         a.click();
         window.URL.revokeObjectURL(url);
         document.body.removeChild(a);
+    }
+
+    // Users paste PlaceIds straight out of Get-PlaceV3 table output, often with
+    // neighbouring columns attached ("<guid> Desk"). Keep just the GUID; anything
+    // without exactly one GUID is rejected loudly rather than saved corrupted.
+    extractPlaceId(value, label) {
+        const trimmed = (value || '').trim();
+        if (!trimmed) return null;
+        const guids = trimmed.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || [];
+        if (guids.length !== 1) {
+            alert(`${label}: "${trimmed}" doesn't contain exactly one PlaceId GUID (like 7b52c3f3-6700-4c58-89cc-e7934bfab853). The value was not saved.`);
+            return null;
+        }
+        return guids[0].toLowerCase();
     }
 
     // Helper methods

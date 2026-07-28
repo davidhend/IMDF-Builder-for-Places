@@ -171,6 +171,23 @@
                 </div>
 
                 <div class="panel">
+                    <h2>Places Correlation Guide</h2>
+                    <div class="help-text">
+                        <p>Each Places directory type pairs with one thing here
+                        (<code>Get-PlaceV3 -AncestorId &lt;buildingId&gt;</code> lists yours):</p>
+                        <ul>
+                            <li><strong>Building</strong> → Building Info &rarr; Places Building ID</li>
+                            <li><strong>Floor</strong> → a Level (click it in the list; its SortOrder in Places must equal the level number)</li>
+                            <li><strong>Room</strong> → a Unit shape</li>
+                            <li><strong>Section</strong> (desk pool) → a Section shape</li>
+                            <li><strong>Desk</strong> → nothing! Desks are never drawn — a desk is located through the Section it belongs to</li>
+                        </ul>
+                        <p>Paste each PlaceId (just the GUID) onto its matching
+                        item. Mismatched types fail the import.</p>
+                    </div>
+                </div>
+
+                <div class="panel">
                     <h2>Help</h2>
                     <div class="help-text">
                         <p><strong>Quick Start:</strong></p>
