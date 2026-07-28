@@ -109,6 +109,11 @@ class IMDFBuilder {
         this.canvas.on('selection:updated', (e) => this.handleSelection(e));
         this.canvas.on('selection:cleared', () => this.clearSelection());
         this.canvas.on('mouse:down', (e) => this.handleCanvasClick(e));
+
+        // Live pixel readout while dragging or resizing a shape.
+        this.canvas.on('object:moving', (e) => this.showObjectMetrics(e.target));
+        this.canvas.on('object:scaling', (e) => this.showObjectMetrics(e.target));
+        this.canvas.on('object:modified', (e) => this.showObjectMetrics(e.target));
     }
 
     attachEventListeners() {
@@ -329,6 +334,32 @@ class IMDFBuilder {
         if (obj && obj.imdfData) {
             this.selectedObject = obj;
             this.showProperties(obj.imdfData);
+            this.showObjectMetrics(obj);
+        }
+    }
+
+    showObjectMetrics(obj) {
+        if (!obj || !obj.imdfData) return;
+        const w = Math.round((obj.width || 0) * (obj.scaleX || 1));
+        const h = Math.round((obj.height || 0) * (obj.scaleY || 1));
+        const name = obj.imdfData.name || obj.imdfData.category || 'shape';
+        this.updateCanvasInfo(`${name}: ${w} × ${h} px @ (${Math.round(obj.left)}, ${Math.round(obj.top)})`);
+        this.syncGeometryInputs(obj);
+    }
+
+    // Keep the properties panel's X/Y/W/H fields following the shape as it is
+    // dragged or resized (only when that shape is the selected one).
+    syncGeometryInputs(obj) {
+        if (this.selectedObject !== obj) return;
+        const values = {
+            'prop-x': Math.round(obj.left),
+            'prop-y': Math.round(obj.top),
+            'prop-w': Math.round((obj.width || 0) * (obj.scaleX || 1)),
+            'prop-h': Math.round((obj.height || 0) * (obj.scaleY || 1))
+        };
+        for (const [id, value] of Object.entries(values)) {
+            const el = document.getElementById(id);
+            if (el) el.value = value;
         }
     }
 
@@ -374,6 +405,20 @@ class IMDFBuilder {
         // units to a Room, sections (desk pools) to a Section.
         if (this.units.some(u => u.id === data.id)) {
             const isSection = data.featureType === 'section';
+            const obj = data.fabricObject;
+            if (obj) {
+                html += `
+                    <div class="property-field">
+                        <label>Position / Size (px):</label>
+                        <div style="display: grid; grid-template-columns: auto 1fr auto 1fr; gap: 4px 6px; align-items: center;">
+                            <span>X</span><input type="number" id="prop-x" value="${Math.round(obj.left)}" />
+                            <span>Y</span><input type="number" id="prop-y" value="${Math.round(obj.top)}" />
+                            <span>W</span><input type="number" id="prop-w" value="${Math.round(obj.width * obj.scaleX)}" min="1" />
+                            <span>H</span><input type="number" id="prop-h" value="${Math.round(obj.height * obj.scaleY)}" min="1" />
+                        </div>
+                    </div>
+                `;
+            }
             html += `
                 <div class="property-field">
                     <label>Map Feature:</label>
@@ -419,6 +464,22 @@ class IMDFBuilder {
         if (featureTypeInput && featureTypeInput.value !== (data.featureType || 'unit')) {
             data.featureType = featureTypeInput.value;
             this.applyFeatureTypeStyle(data.fabricObject, data.featureType);
+        }
+
+        const xInput = document.getElementById('prop-x');
+        if (xInput && data.fabricObject) {
+            const x = parseFloat(xInput.value);
+            const y = parseFloat(document.getElementById('prop-y').value);
+            const w = parseFloat(document.getElementById('prop-w').value);
+            const h = parseFloat(document.getElementById('prop-h').value);
+            if ([x, y, w, h].every(Number.isFinite) && w > 0 && h > 0) {
+                data.fabricObject.set({ left: x, top: y, width: w, height: h, scaleX: 1, scaleY: 1 });
+                data.fabricObject.setCoords();
+                this.canvas.renderAll();
+                this.showObjectMetrics(data.fabricObject);
+            } else {
+                alert('Position/size values must be numbers (width and height above 0) — geometry not changed.');
+            }
         }
 
         alert('Properties updated!');
