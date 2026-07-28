@@ -652,7 +652,9 @@ class IMDFBuilder {
         ctx.drawImage(el, 0, 0, w, h);
         const px = ctx.getImageData(0, 0, w, h).data;
 
-        // 1 = open space (light or transparent), 0 = ink (walls, lines)
+        // 1 = open space (light or transparent), 0 = ink (walls, lines).
+        // Thin lines are kept on purpose: door swing arcs are thin, and they
+        // are what seals a doorway once the ink is dilated below.
         let open = new Uint8Array(w * h);
         for (let i = 0; i < w * h; i++) {
             const lum = px[i * 4 + 3] < 40
@@ -661,19 +663,49 @@ class IMDFBuilder {
             open[i] = lum > 180 ? 1 : 0;
         }
 
-        // Close 1px-wide lines (furniture symbols) so a room stays one region;
-        // real walls are thicker and survive. Two passes handle diagonals.
-        for (let pass = 0; pass < 2; pass++) {
-            const closed = new Uint8Array(open);
-            for (let y = 1; y < h - 1; y++) {
-                for (let x = 1; x < w - 1; x++) {
+        // Building bounds = bounding box of the largest connected ink blob
+        // (the outer wall). Rooms live inside it; dashed construction marks,
+        // title text and dimension lines outside it get filtered away.
+        const inkLabel = new Uint8Array(w * h);
+        const inkStack = [];
+        let bounds = null;
+        for (let start = 0; start < w * h; start++) {
+            if (open[start] || inkLabel[start]) continue;
+            let minX = w, minY = h, maxX = 0, maxY = 0, count = 0;
+            inkStack.push(start);
+            while (inkStack.length) {
+                const i = inkStack.pop();
+                if (i < 0 || i >= w * h || inkLabel[i] || open[i]) continue;
+                inkLabel[i] = 1;
+                count++;
+                const x = i % w, y = (i / w) | 0;
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+                if (x > 0) inkStack.push(i - 1);
+                if (x < w - 1) inkStack.push(i + 1);
+                inkStack.push(i - w, i + w);
+            }
+            if (!bounds || count > bounds.count) bounds = { minX, minY, maxX, maxY, count };
+        }
+
+        // Dilate the ink to seal door openings (door leaf + swing arc close
+        // the gap once thickened). Boxes are grown back by the same amount.
+        const sealRadius = Math.max(2, Math.round(Math.max(w, h) / 300));
+        for (let pass = 0; pass < sealRadius; pass++) {
+            const eroded = new Uint8Array(open);
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
                     const i = y * w + x;
-                    if (!open[i] && ((open[i - 1] && open[i + 1]) || (open[i - w] && open[i + w]))) {
-                        closed[i] = 1;
+                    if (open[i] && (
+                        (x > 0 && !open[i - 1]) || (x < w - 1 && !open[i + 1]) ||
+                        (y > 0 && !open[i - w]) || (y < h - 1 && !open[i + w]))) {
+                        eroded[i] = 0;
                     }
                 }
             }
-            open = closed;
+            open = eroded;
         }
 
         // Flood from the borders: everything reachable is outside the building.
@@ -727,6 +759,7 @@ class IMDFBuilder {
         });
 
         const imgArea = w * h;
+        const tol = sealRadius + 2;
         let added = 0;
         let skipped = 0;
         for (const r of regions.sort((a, b) => b.count - a.count)) {
@@ -735,11 +768,14 @@ class IMDFBuilder {
             const bh = r.maxY - r.minY + 1;
             const areaFraction = r.count / imgArea;
             if (areaFraction < 0.0015 || areaFraction > 0.35) continue; // noise / whole floor
-            if (r.count / (bw * bh) < 0.55) { skipped++; continue; }    // corridors, L-shapes
-            const left = toCanvasX(r.minX);
-            const top = toCanvasY(r.minY);
-            const width = toCanvasX(r.maxX + 1) - left;
-            const height = toCanvasY(r.maxY + 1) - top;
+            if (bw < 6 || bh < 6) continue;
+            if (bounds && (r.minX < bounds.minX - tol || r.maxX > bounds.maxX + tol ||
+                           r.minY < bounds.minY - tol || r.maxY > bounds.maxY + tol)) continue;
+            if (r.count / (bw * bh) < 0.5) { skipped++; continue; }     // corridors, L-shapes
+            const left = toCanvasX(r.minX - sealRadius);
+            const top = toCanvasY(r.minY - sealRadius);
+            const width = toCanvasX(r.maxX + 1 + sealRadius) - left;
+            const height = toCanvasY(r.maxY + 1 + sealRadius) - top;
             if (coveredByExisting(left + width / 2, top + height / 2)) continue;
 
             const rect = new fabric.Rect({
