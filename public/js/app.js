@@ -638,14 +638,15 @@ class IMDFBuilder {
         this.updateCounts();
     }
 
-    // Detect enclosed rooms on the uploaded floor plan and add an editable
-    // shape for each. Pure pixel work: binarize, seal door openings, flood
-    // away everything connected to the image border, then take each remaining
-    // open region as a room. Rectangular rooms become boxes; corridors and
-    // L-shaped rooms become polygons that follow the walls. The building's
-    // outer wall is traced into a footprint outline, and free-standing ink
-    // clusters inside the building (desks, tables, chairs) become furniture
-    // fixtures so the exported map reads like the original plan.
+    // Detect the floor plan's structure and add editable shapes: rooms as
+    // boxes or wall-following polygons, the outer wall as the footprint
+    // outline, and furniture (desks, chairs, tables — light-gray or dark,
+    // free-standing or pushed against a wall) as traced fixture polygons.
+    // Walls are identified geometrically — thick strokes, plus long straight
+    // hairlines attached to the wall network — so furniture ink never
+    // fragments a room, and doorways are sealed by bridging straight gaps
+    // between wall runs. All size thresholds are relative to the detected
+    // building, so page margins and export scale don't change the result.
     autoTraceRooms() {
         if (!this.currentLevel) {
             alert('Please add and select a level first');
@@ -661,16 +662,10 @@ class IMDFBuilder {
         const ih = el.naturalHeight || el.height;
         const maxDim = 1200;
 
-        // Binarize the plan at a given scale and label its ink blobs. The
-        // largest blob is the outer wall — its bounding box bounds the
-        // building, so dashed construction marks, title text and dimension
-        // lines outside it get filtered away.
-        // 1 = open space (light or transparent), 0 = ink (walls, lines).
-        // Thin lines are kept on purpose: door swing arcs are thin, and they
-        // are what seals a doorway once the ink is dilated below.
-        // `mark` additionally captures faint strokes — CAD plans draw
-        // furniture in light gray, well above the wall-ink threshold — and
-        // feeds only the furniture detector, never room detection.
+        // Binarize at a given scale and label ink blobs; the largest blob is
+        // the wall network and its bounding box bounds the building. `ink`
+        // holds dark strokes; `mark` also captures faint ones (light-gray
+        // furniture) and feeds only the furniture detector.
         const analyze = (scale) => {
             const aw = Math.max(1, Math.round(iw * scale));
             const ah = Math.max(1, Math.round(ih * scale));
@@ -681,27 +676,27 @@ class IMDFBuilder {
             ctx.drawImage(el, 0, 0, aw, ah);
             const px = ctx.getImageData(0, 0, aw, ah).data;
 
-            const open = new Uint8Array(aw * ah);
+            const ink = new Uint8Array(aw * ah);
             const mark = new Uint8Array(aw * ah);
             for (let i = 0; i < aw * ah; i++) {
                 const lum = px[i * 4 + 3] < 40
                     ? 255
                     : 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
-                open[i] = lum > 180 ? 1 : 0;
-                mark[i] = lum <= 245 ? 1 : 0;
+                if (lum <= 180) ink[i] = 1;
+                if (lum <= 245) mark[i] = 1;
             }
 
             const inkComp = new Int32Array(aw * ah);
+            const comps = [{}];
             const inkStack = [];
             let bounds = null;
-            let nextId = 1;
             for (let start = 0; start < aw * ah; start++) {
-                if (open[start] || inkComp[start]) continue;
-                const c = { id: nextId++, minX: aw, minY: ah, maxX: 0, maxY: 0, count: 0 };
+                if (!ink[start] || inkComp[start]) continue;
+                const c = { id: comps.length, minX: aw, minY: ah, maxX: 0, maxY: 0, count: 0 };
                 inkStack.push(start);
                 while (inkStack.length) {
                     const i = inkStack.pop();
-                    if (i < 0 || i >= aw * ah || inkComp[i] || open[i]) continue;
+                    if (i < 0 || i >= aw * ah || inkComp[i] || !ink[i]) continue;
                     inkComp[i] = c.id;
                     c.count++;
                     const x = i % aw, y = (i / aw) | 0;
@@ -713,15 +708,14 @@ class IMDFBuilder {
                     if (x < aw - 1) inkStack.push(i + 1);
                     inkStack.push(i - aw, i + aw);
                 }
+                comps.push(c);
                 if (!bounds || c.count > bounds.count) bounds = c;
             }
-            return { w: aw, h: ah, open, mark, inkComp, bounds };
+            return { w: aw, h: ah, ink, mark, inkComp, comps, bounds };
         };
 
-        // First pass scans the whole page; if the plan sits inside wide page
-        // margins (a PDF sheet, a title block), rescan at a scale where the
-        // building itself gets ~1000px, so small offices keep enough pixels
-        // to detect regardless of how much white space surrounds the plan.
+        // Two-pass: if the plan sits inside wide page margins, rescan at a
+        // scale where the building itself gets ~1000px.
         let s = Math.min(1, maxDim / Math.max(iw, ih));
         let A = analyze(s);
         if (A.bounds) {
@@ -734,37 +728,113 @@ class IMDFBuilder {
                 A = analyze(s);
             }
         }
-        const { w, h, mark, inkComp, bounds } = A;
-        let open = A.open;
+        const { w, h, ink, mark, inkComp, comps, bounds } = A;
+        if (!bounds) {
+            alert('No drawing was detected on the floor plan image.');
+            return;
+        }
+        const bW = bounds.maxX - bounds.minX + 1;
+        const bH = bounds.maxY - bounds.minY + 1;
+        const bMax = Math.max(bW, bH);
+        const bboxArea = bW * bH;
 
-        // Untouched copy of the binarized image: room regrowth (below) must
-        // stop at real wall pixels, and furniture detection reads real ink.
-        const openOrig = new Uint8Array(open);
+        // Structural ink = walls. Thick strokes (a pixel whose 4 neighbours
+        // are all ink) are always walls; hairline partitions are long
+        // straight runs in a component that also contains thick wall ink.
+        // Furniture strokes are short and thin, so they never qualify.
+        const thickCore = new Uint8Array(w * h);
+        for (let y = 1; y < h - 1; y++) {
+            for (let x = 1; x < w - 1; x++) {
+                const i = y * w + x;
+                if (ink[i] && ink[i - 1] && ink[i + 1] && ink[i - w] && ink[i + w]) thickCore[i] = 1;
+            }
+        }
+        const hasCore = new Uint8Array(comps.length + 1);
+        for (let i = 0; i < w * h; i++) if (thickCore[i]) hasCore[inkComp[i]] = 1;
 
-        // Dilate the ink to seal door openings (door leaf + swing arc close
-        // the gap once thickened). Boxes are grown back by the same amount.
-        // Sized against the building, not the image — a plan exported with
-        // wide page margins must seal identically to a tight crop.
-        const bMax = bounds
-            ? Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY)
-            : Math.max(w, h);
-        const sealRadius = Math.max(2, Math.round(bMax / 250));
-        for (let pass = 0; pass < sealRadius; pass++) {
-            const eroded = new Uint8Array(open);
-            for (let y = 0; y < h; y++) {
-                for (let x = 0; x < w; x++) {
-                    const i = y * w + x;
-                    if (open[i] && (
-                        (x > 0 && !open[i - 1]) || (x < w - 1 && !open[i + 1]) ||
-                        (y > 0 && !open[i - w]) || (y < h - 1 && !open[i + w]))) {
-                        eroded[i] = 0;
-                    }
+        const lMin = Math.max(20, Math.round(bMax / 28));
+        const runH = new Int32Array(w * h);
+        const runV = new Int32Array(w * h);
+        for (let y = 0; y < h; y++) {
+            let start = -1;
+            for (let x = 0; x <= w; x++) {
+                const on = x < w && ink[y * w + x];
+                if (on && start < 0) start = x;
+                if (!on && start >= 0) {
+                    const len = x - start;
+                    for (let k = start; k < x; k++) runH[y * w + k] = len;
+                    start = -1;
                 }
             }
-            open = eroded;
+        }
+        for (let x = 0; x < w; x++) {
+            let start = -1;
+            for (let y = 0; y <= h; y++) {
+                const on = y < h && ink[y * w + x];
+                if (on && start < 0) start = y;
+                if (!on && start >= 0) {
+                    const len = y - start;
+                    for (let k = start; k < y; k++) runV[k * w + x] = len;
+                    start = -1;
+                }
+            }
+        }
+        let structural = new Uint8Array(w * h);
+        for (let i = 0; i < w * h; i++) {
+            if (!ink[i]) continue;
+            if (thickCore[i] ||
+                (Math.max(runH[i], runV[i]) >= lMin && hasCore[inkComp[i]])) structural[i] = 1;
+        }
+        {   // grow by one pixel to swallow anti-aliasing halos
+            const grown = new Uint8Array(structural);
+            for (let y = 1; y < h - 1; y++) {
+                for (let x = 1; x < w - 1; x++) {
+                    const i = y * w + x;
+                    if (!structural[i] && (structural[i - 1] || structural[i + 1] ||
+                        structural[i - w] || structural[i + w])) grown[i] = 1;
+                }
+            }
+            structural = grown;
         }
 
-        // Flood from the borders: everything reachable is outside the building.
+        // Seal doorways: bridge straight gaps ≤ ~1.2m between wall runs,
+        // row-wise and column-wise. Furniture isn't structural, so it never
+        // partitions a room.
+        const gapMax = Math.max(8, Math.round(bMax / 40));
+        const closed = new Uint8Array(structural);
+        for (let y = 0; y < h; y++) {
+            let runEnd = -1, runLen = 0;
+            for (let x = 0; x < w; x++) {
+                const i = y * w + x;
+                if (structural[i]) {
+                    if (runEnd >= 0 && x - runEnd - 1 >= 1 && x - runEnd - 1 <= gapMax && runLen >= 3) {
+                        let len = 0;
+                        while (x + len < w && structural[y * w + x + len]) len++;
+                        if (len >= 3) for (let k = runEnd + 1; k < x; k++) closed[y * w + k] = 1;
+                    }
+                    runLen = (x > 0 && structural[i - 1]) ? runLen + 1 : 1;
+                    runEnd = x;
+                }
+            }
+        }
+        for (let x = 0; x < w; x++) {
+            let runEnd = -1, runLen = 0;
+            for (let y = 0; y < h; y++) {
+                const i = y * w + x;
+                if (structural[i]) {
+                    if (runEnd >= 0 && y - runEnd - 1 >= 1 && y - runEnd - 1 <= gapMax && runLen >= 3) {
+                        let len = 0;
+                        while (y + len < h && structural[(y + len) * w + x]) len++;
+                        if (len >= 3) for (let k = runEnd + 1; k < y; k++) closed[k * w + x] = 1;
+                    }
+                    runLen = (y > 0 && structural[i - w]) ? runLen + 1 : 1;
+                    runEnd = y;
+                }
+            }
+        }
+
+        // Flood from the borders: everything reachable is outside. Remaining
+        // open regions (walls sealed, furniture floodable) are rooms.
         const label = new Int32Array(w * h);
         const stack = [];
         for (let x = 0; x < w; x++) stack.push(x, (h - 1) * w + x);
@@ -773,7 +843,7 @@ class IMDFBuilder {
             let minX = w, minY = h, maxX = 0, maxY = 0, count = 0;
             while (stack.length) {
                 const i = stack.pop();
-                if (i < 0 || i >= w * h || label[i] !== 0 || !open[i]) continue;
+                if (i < 0 || i >= w * h || label[i] !== 0 || closed[i]) continue;
                 label[i] = seedLabel;
                 count++;
                 const x = i % w;
@@ -791,49 +861,15 @@ class IMDFBuilder {
             return { minX, minY, maxX, maxY, count };
         };
         flood(-1, false);
-
-        // Remaining open regions are enclosed spaces: room candidates.
         const regions = [];
         let nextLabel = 1;
         for (let start = 0; start < w * h; start++) {
-            if (label[start] === 0 && open[start]) {
+            if (label[start] === 0 && !closed[start]) {
                 stack.push(start);
                 const r = flood(nextLabel, true);
                 r.label = nextLabel;
                 regions.push(r);
                 nextLabel++;
-            }
-        }
-
-        // Grow each room back through the sealed band so traced outlines sit
-        // on the walls instead of a seal-radius short of them. Growth only
-        // claims pixels that were open before sealing, so it hard-stops at
-        // real wall ink; in a doorway the band is split between the two
-        // rooms that meet there.
-        for (let pass = 0; pass < sealRadius; pass++) {
-            const adopted = [];
-            for (let y = 0; y < h; y++) {
-                for (let x = 0; x < w; x++) {
-                    const i = y * w + x;
-                    if (label[i] !== 0 || !openOrig[i] || open[i]) continue;
-                    const near =
-                        (x > 0 && label[i - 1] > 0 && label[i - 1]) ||
-                        (x < w - 1 && label[i + 1] > 0 && label[i + 1]) ||
-                        (y > 0 && label[i - w] > 0 && label[i - w]) ||
-                        (y < h - 1 && label[i + w] > 0 && label[i + w]) || 0;
-                    if (near) adopted.push(i, near);
-                }
-            }
-            for (let k = 0; k < adopted.length; k += 2) {
-                const i = adopted[k], lab = adopted[k + 1];
-                label[i] = lab;
-                const r = regions[lab - 1];
-                const x = i % w, y = (i / w) | 0;
-                r.count++;
-                if (x < r.minX) r.minX = x;
-                if (x > r.maxX) r.maxX = x;
-                if (y < r.minY) r.minY = y;
-                if (y > r.maxY) r.maxY = y;
             }
         }
 
@@ -849,8 +885,7 @@ class IMDFBuilder {
                      && cy >= o.top && cy <= o.top + o.height * o.scaleY;
         });
 
-        const imgArea = w * h;
-        const tol = sealRadius + 2;
+        const tol = gapMax;
         const unitStyle = {
             fill: 'rgba(0, 120, 212, 0.3)',
             stroke: '#0078d4',
@@ -859,12 +894,6 @@ class IMDFBuilder {
         let added = 0;
         let polygons = 0;
         const acceptedRegions = [];
-        // Room size limits are fractions of the building's bounding box, not
-        // of the image — page margins around the plan must not change what
-        // counts as a room.
-        const bboxArea = bounds
-            ? (bounds.maxX - bounds.minX + 1) * (bounds.maxY - bounds.minY + 1)
-            : imgArea;
         for (const r of regions.sort((a, b) => b.count - a.count)) {
             if (added >= 150) break;
             const bw = r.maxX - r.minX + 1;
@@ -872,8 +901,8 @@ class IMDFBuilder {
             const buildingFraction = r.count / bboxArea;
             if (buildingFraction < 0.0024 || buildingFraction > 0.6) continue; // noise / whole floor
             if (bw < 6 || bh < 6) continue;
-            if (bounds && (r.minX < bounds.minX - tol || r.maxX > bounds.maxX + tol ||
-                           r.minY < bounds.minY - tol || r.maxY > bounds.maxY + tol)) continue;
+            if (r.minX < bounds.minX - tol || r.maxX > bounds.maxX + tol ||
+                r.minY < bounds.minY - tol || r.maxY > bounds.maxY + tol) continue;
 
             // Near-full boxes stay rectangles (easiest to edit); corridors and
             // L-shaped rooms get a polygon traced along their actual walls.
@@ -893,7 +922,7 @@ class IMDFBuilder {
                     r.minX, r.minY, r.maxX, r.maxY, w, h);
                 if (outline.length < 4) continue;
                 const points = this.simplifyPath(outline, 1.5)
-                    .map(([px, py]) => ({ x: toCanvasX(px), y: toCanvasY(py) }));
+                    .map(([px2, py2]) => ({ x: toCanvasX(px2), y: toCanvasY(py2) }));
                 if (points.length < 3) continue;
                 shape = new fabric.Polygon(points, { ...unitStyle, objectCaching: false });
                 polygons++;
@@ -922,96 +951,72 @@ class IMDFBuilder {
             added++;
         }
 
-        // Trace the building's outer wall: everything not reachable from the
-        // image border, walked from the wall blob's top edge. Exported as the
-        // footprint/level outline so Places shows the real building shape.
-        if (bounds) {
-            let startX = -1;
-            for (let x = bounds.minX; x <= bounds.maxX && startX < 0; x++) {
-                if (inkComp[bounds.minY * w + x] === bounds.id) startX = x;
+        // Trace the building's outer wall, starting from the topmost wall
+        // pixel (thin exterior ink can be claimed by the outside flood, so
+        // only a structural pixel is safely inside the mask). Exported as
+        // the footprint/level outline.
+        {
+            let sx = -1, sy = -1;
+            for (let y = bounds.minY; y <= bounds.maxY && sx < 0; y++) {
+                for (let x = bounds.minX; x <= bounds.maxX; x++) {
+                    if (closed[y * w + x]) { sx = x; sy = y; break; }
+                }
             }
-            if (startX >= 0) {
+            if (sx >= 0) {
                 const outline = this.traceMaskOutline(
                     (x, y) => x >= bounds.minX && x <= bounds.maxX &&
                               y >= bounds.minY && y <= bounds.maxY &&
                               label[y * w + x] !== -1,
-                    bounds.minX, bounds.minY, bounds.maxX, bounds.maxY, w, h,
-                    startX, bounds.minY);
+                    bounds.minX, bounds.minY, bounds.maxX, bounds.maxY, w, h, sx, sy);
                 if (outline.length >= 4) {
                     const points = this.simplifyPath(outline, 2)
-                        .map(([px, py]) => ({ x: toCanvasX(px), y: toCanvasY(py) }));
+                        .map(([px2, py2]) => ({ x: toCanvasX(px2), y: toCanvasY(py2) }));
                     if (points.length >= 3) this.setBuildingOutline(points);
                 }
             }
         }
 
-        // Furniture: ink that lives inside exactly one detected room. Wall
-        // ink always separates two rooms (or a room and the outside), so an
-        // ink pixel whose open neighbourhood belongs to a single accepted
-        // room is furniture — desks, chairs and tables, including ones drawn
-        // touching a wall. Nearby ink merges into one block per desk group.
+        // Furniture: visible strokes (light or dark) inside an accepted room
+        // that aren't walls, plus freestanding thick structures that sit as
+        // an island inside exactly one room (cubicle banks, solid tables,
+        // panel grids). Each connected cluster becomes its own traced
+        // polygon, so a desk renders desk-shaped. Door swing arcs come
+        // through as thin arcs — Places rejects IMDF opening files, so this
+        // is the only way doorways show at all.
         let furniture = 0;
-        if (bounds && acceptedRegions.length) {
+        if (acceptedRegions.length) {
             const acceptedLabel = new Uint8Array(nextLabel);
             for (const r of acceptedRegions) acceptedLabel[r.label] = 1;
+            const furnMask = new Uint8Array(w * h);
+            for (let i = 0; i < w * h; i++) {
+                if (mark[i] && !structural[i] && !closed[i] && label[i] > 0 && acceptedLabel[label[i]]) furnMask[i] = 1;
+            }
 
-            // Walls are thick strokes; furniture is hairline. Ink with a
-            // "core" (all four neighbours also ink) is structural — without
-            // this, the inner face of a thick outer wall reads as furniture
-            // because it only ever sees one room. The core is grown two
-            // pixels to also claim the wall's own boundary pixels.
-            let structural = new Uint8Array(w * h);
+            const adjRoom = new Int32Array(comps.length + 1); // 0 none, -2 mixed/outside, else room label
             for (let y = 1; y < h - 1; y++) {
                 for (let x = 1; x < w - 1; x++) {
                     const i = y * w + x;
-                    if (!openOrig[i] && !openOrig[i - 1] && !openOrig[i + 1] &&
-                        !openOrig[i - w] && !openOrig[i + w]) structural[i] = 1;
-                }
-            }
-            for (let pass = 0; pass < 2; pass++) {
-                const grown = new Uint8Array(structural);
-                for (let y = 1; y < h - 1; y++) {
-                    for (let x = 1; x < w - 1; x++) {
-                        const i = y * w + x;
-                        if (!structural[i] && (structural[i - 1] || structural[i + 1] ||
-                            structural[i - w] || structural[i + w])) grown[i] = 1;
-                    }
-                }
-                structural = grown;
-            }
-
-            const R = sealRadius + 2;
-            const furnMask = new Uint8Array(w * h);
-            for (let y = Math.max(1, bounds.minY); y <= Math.min(h - 2, bounds.maxY); y++) {
-                for (let x = Math.max(1, bounds.minX); x <= Math.min(w - 2, bounds.maxX); x++) {
-                    const i = y * w + x;
-                    if (!mark[i] || structural[i]) continue;
-                    let room = 0;
-                    let isFurniture = true;
-                    for (let dy = -R; dy <= R && isFurniture; dy++) {
-                        const yy = y + dy;
-                        if (yy < 0 || yy >= h) continue;
-                        for (let dx = -R; dx <= R; dx++) {
-                            const xx = x + dx;
-                            if (xx < 0 || xx >= w) continue;
-                            const l = label[yy * w + xx];
-                            if (l === -1) { isFurniture = false; break; }
-                            if (l > 0 && acceptedLabel[l]) {
-                                if (room === 0) room = l;
-                                else if (room !== l) { isFurniture = false; break; }
-                            }
+                    if (!ink[i]) continue;
+                    const c = inkComp[i];
+                    if (c === bounds.id || adjRoom[c] === -2) continue;
+                    for (const n of [i - 1, i + 1, i - w, i + w]) {
+                        const l = label[n];
+                        if (l === -1) { adjRoom[c] = -2; break; }
+                        if (l > 0 && acceptedLabel[l]) {
+                            if (adjRoom[c] === 0) adjRoom[c] = l;
+                            else if (adjRoom[c] !== l) { adjRoom[c] = -2; break; }
                         }
                     }
-                    if (isFurniture && room) furnMask[i] = 1;
+                }
+            }
+            let hasIslands = false;
+            for (let c = 1; c < adjRoom.length; c++) if (adjRoom[c] > 0) hasIslands = true;
+            if (hasIslands) {
+                for (let i = 0; i < w * h; i++) {
+                    if (ink[i] && adjRoom[inkComp[i]] > 0) furnMask[i] = 1;
                 }
             }
 
-            // Each connected furniture-ink cluster becomes its own traced
-            // polygon, so a desk renders as a desk-shaped block, a chair as a
-            // chair, a table as a table — no crude group boxes. Door swing
-            // arcs come through as thin arcs, which usefully marks doorways
-            // (Places rejects IMDF opening files, so this is the only way
-            // doors appear at all).
             const fLabel = new Int32Array(w * h);
             const fStack = [];
             const clusters = [];
@@ -1037,8 +1042,9 @@ class IMDFBuilder {
                 clusters.push(cl);
             }
 
-            const maxDimX = (bounds.maxX - bounds.minX) * 0.35;
-            const maxDimY = (bounds.maxY - bounds.minY) * 0.35;
+            const minInk = Math.max(6, Math.round(bboxArea / 80000));
+            const maxDimX = bW * 0.35;
+            const maxDimY = bH * 0.35;
             const coveredByFixture = (x, y) => this.fixtures.some(f => {
                 const o = f.fabricObject;
                 return o && o.width !== undefined && x >= o.left && x <= o.left + o.width * (o.scaleX || 1)
@@ -1046,7 +1052,7 @@ class IMDFBuilder {
             });
             for (const cl of clusters.sort((a, b) => b.count - a.count)) {
                 if (furniture >= 400) break;
-                if (cl.count < 6) continue;
+                if (cl.count < minInk) continue;
                 if (cl.maxX - cl.minX < 3 && cl.maxY - cl.minY < 3) continue;
                 if (cl.maxX - cl.minX > maxDimX || cl.maxY - cl.minY > maxDimY) continue;
                 const outline = this.traceMaskOutline(
@@ -1054,7 +1060,7 @@ class IMDFBuilder {
                     cl.minX, cl.minY, cl.maxX, cl.maxY, w, h);
                 if (outline.length < 4) continue;
                 const points = this.simplifyPath(outline, 1)
-                    .map(([px, py]) => ({ x: toCanvasX(px), y: toCanvasY(py) }));
+                    .map(([px2, py2]) => ({ x: toCanvasX(px2), y: toCanvasY(py2) }));
                 if (points.length < 3) continue;
                 const shape = new fabric.Polygon(points, {
                     fill: 'rgba(108, 117, 125, 0.35)',
@@ -1087,9 +1093,9 @@ class IMDFBuilder {
         } else {
             alert(`Auto-trace added ${added} room(s)` +
                   (polygons ? ` (${polygons} traced as wall-following polygons)` : '') +
-                  (furniture ? `, ${furniture} furniture block(s)` : '') +
+                  (furniture ? `, ${furniture} furniture piece(s)` : '') +
                   (this.buildingOutline ? ', and the building outline (exported as the footprint)' : '') +
-                  '. Move, resize, rename, or delete any shape afterwards. Note: doors cannot be shown in Microsoft Places — it rejects IMDF opening files.');
+                  '. Move, resize, rename, or delete any shape afterwards.');
         }
     }
 
