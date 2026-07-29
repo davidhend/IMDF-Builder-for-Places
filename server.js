@@ -281,10 +281,18 @@ function generateIMDFFiles(projectData) {
   // degrees). Microsoft Places requires georeferenced geometry, so shift the
   // whole drawing onto the venue's real location by centring its bounding box
   // there. Canvas y grows downward, so it's flipped onto latitude.
+  // Traced outer wall from auto-trace (single ring, canvas units). When
+  // present it becomes the real footprint/level outline, and it anchors the
+  // physical-width fit so "Building Width" means the building, not the units.
+  const outlineRing = Array.isArray(building?.outline?.[0]) && building.outline[0].length >= 3
+    ? building.outline[0]
+    : null;
+
   const rings = [];
   for (const unit of units) {
     for (const ring of unit.coordinates || []) rings.push(ring);
   }
+  if (outlineRing) rings.push(outlineRing);
   if (rings.length === 0 && building?.coordinates) {
     for (const ring of building.coordinates) rings.push(ring);
   }
@@ -323,16 +331,25 @@ function generateIMDFFiles(projectData) {
     return i === 0 ? ensureCounterclockwise(projected) : projected;
   });
 
-  // Footprint = drawing bounding box plus a margin, so every unit falls inside it.
+  // Footprint = the traced building outline when auto-trace found one,
+  // otherwise the drawing bounding box plus a margin so every unit falls
+  // inside it.
+  const closeRing = ring => {
+    const first = ring[0];
+    const last = ring[ring.length - 1];
+    return (first[0] === last[0] && first[1] === last[1]) ? ring : [...ring, [first[0], first[1]]];
+  };
   const padX = Math.max((maxX - minX) * 0.1, 0.00005);
   const padY = Math.max((maxY - minY) * 0.1, 0.00005);
-  const footprintPolygon = projectPolygon([[
-    [minX - padX, minY - padY],
-    [minX - padX, maxY + padY],
-    [maxX + padX, maxY + padY],
-    [maxX + padX, minY - padY],
-    [minX - padX, minY - padY]
-  ]]);
+  const footprintPolygon = outlineRing
+    ? projectPolygon([closeRing(outlineRing)])
+    : projectPolygon([[
+        [minX - padX, minY - padY],
+        [minX - padX, maxY + padY],
+        [maxX + padX, maxY + padY],
+        [maxX + padX, minY - padY],
+        [minX - padX, minY - padY]
+      ]]);
 
   // Generate building.geojson — Microsoft Places requires building geometry to be null;
   // the building outline goes in footprint.geojson instead.
@@ -434,19 +451,43 @@ function generateIMDFFiles(projectData) {
     features: sections.map(s => drawnFeature(s, 'section'))
   };
 
-  // Generate fixture.geojson
+  // Generate fixture.geojson. IMDF fixtures are polygons: furniture traced by
+  // the client already is one; manually drawn wall/door lines are widened
+  // into thin strips, and legacy point fixtures become small squares.
+  const fixturePolygon = fixture => {
+    const coords = fixture.coordinates;
+    if (fixture.geometryType === 'Polygon' && Array.isArray(coords?.[0])) {
+      return projectPolygon(coords);
+    }
+    if (Array.isArray(coords) && Array.isArray(coords[0]) && coords.length >= 2) {
+      const [x1, y1] = coords[0];
+      const [x2, y2] = coords[coords.length - 1];
+      const len = Math.hypot(x2 - x1, y2 - y1) || 1;
+      const half = 0.75 / 100000; // ~1.5 canvas px wide
+      const ox = (-(y2 - y1) / len) * half;
+      const oy = ((x2 - x1) / len) * half;
+      return projectPolygon([[
+        [x1 + ox, y1 + oy], [x2 + ox, y2 + oy],
+        [x2 - ox, y2 - oy], [x1 - ox, y1 - oy],
+        [x1 + ox, y1 + oy]
+      ]]);
+    }
+    const [px, py] = Array.isArray(coords) && typeof coords[0] === 'number' ? coords : [centerX, centerY];
+    const r = 1 / 100000;
+    return projectPolygon([[
+      [px - r, py - r], [px + r, py - r], [px + r, py + r], [px - r, py + r], [px - r, py - r]
+    ]]);
+  };
   const fixtureFeatures = {
     type: 'FeatureCollection',
     features: fixtures.map(fixture => ({
       type: 'Feature',
       id: fixture.id || randomUUID(),
       feature_type: 'fixture',
-      geometry: (fixture.geometryType || 'Point') === 'Point'
-        ? { type: 'Point', coordinates: projectPoint(fixture.coordinates || [centerX, centerY]) }
-        : { type: fixture.geometryType, coordinates: projectPolygon(fixture.coordinates || []) },
+      geometry: { type: 'Polygon', coordinates: fixturePolygon(fixture) },
       properties: {
-        category: fixture.category || 'wall',
-        name: null,
+        category: fixture.category || 'furniture',
+        name: toLabels(fixture.name),
         level_id: fixture.levelId || null
       }
     }))
