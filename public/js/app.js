@@ -108,7 +108,13 @@ class IMDFBuilder {
         this.canvas.on('selection:created', (e) => this.handleSelection(e));
         this.canvas.on('selection:updated', (e) => this.handleSelection(e));
         this.canvas.on('selection:cleared', () => this.clearSelection());
-        this.canvas.on('mouse:down', (e) => this.handleCanvasClick(e));
+        this.canvas.on('mouse:down', (e) => {
+            if (e.e && e.e.altKey) {
+                this.cycleSelectionUnderPointer(e);
+                return;
+            }
+            this.handleCanvasClick(e);
+        });
 
         // Live pixel readout while dragging or resizing a shape.
         this.canvas.on('object:moving', (e) => this.showObjectMetrics(e.target));
@@ -337,6 +343,24 @@ class IMDFBuilder {
             this.showProperties(obj.imdfData);
             this.showObjectMetrics(obj);
         }
+    }
+
+    // Alt+click cycles through overlapping shapes under the cursor, so a
+    // shape buried beneath another (a desk fixture under a furniture piece,
+    // a room under a section) can still be selected and moved.
+    cycleSelectionUnderPointer(event) {
+        const pointer = this.canvas.getPointer(event.e);
+        const point = new fabric.Point(pointer.x, pointer.y);
+        const hits = this.canvas.getObjects()
+            .filter(o => o.selectable !== false && o.imdfData && o.containsPoint(point))
+            .reverse(); // topmost first, then progressively deeper
+        if (hits.length === 0) return;
+        const active = this.canvas.getActiveObject();
+        const next = hits[(hits.indexOf(active) + 1) % hits.length];
+        this.canvas.setActiveObject(next);
+        this.canvas.renderAll();
+        const name = next.imdfData.name || next.imdfData.category || 'shape';
+        this.updateCanvasInfo(`Selected "${name}" — Alt+click again for the shape beneath`);
     }
 
     showObjectMetrics(obj) {
