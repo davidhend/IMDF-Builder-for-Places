@@ -441,9 +441,24 @@ function generateIMDFFiles(projectData) {
     }
   });
 
+  // Sections render with no visible border in Microsoft Places, so each one
+  // also gets a coincident unit — the unit draws the outline, the section
+  // carries the desk-pool correlation. The twin's id is derived from the
+  // section id (last block inverted) so it stays stable across exports.
+  const twinUnitId = id => {
+    const base = String(id || randomUUID());
+    const tail = base.slice(24).split('').map(c => {
+      const n = parseInt(c, 16);
+      return Number.isNaN(n) ? c : (15 - n).toString(16);
+    }).join('');
+    return base.slice(0, 24) + tail;
+  };
   const unitFeatures = {
     type: 'FeatureCollection',
-    features: roomUnits.map(u => drawnFeature(u, 'unit'))
+    features: [
+      ...roomUnits.map(u => drawnFeature(u, 'unit')),
+      ...sections.map(s => drawnFeature({ ...s, id: twinUnitId(s.id), placeId: null }, 'unit'))
+    ]
   };
 
   const sectionFeatures = {
@@ -594,13 +609,15 @@ function validatePlacesCompatibility(files) {
 function generateMapFeaturesCSV(projectData) {
   const files = generateIMDFFiles(projectData);
   const placeIdsByFeatureId = new Map();
-  const directoryTypes = { building: 'Building', level: 'Floor', unit: 'Room', section: 'Section' };
+  // Desks correlate to fixture features (the docs' correlation step covers
+  // "each building, floor, room, desk and desk pool").
+  const directoryTypes = { building: 'Building', level: 'Floor', unit: 'Room', section: 'Section', fixture: 'Desk' };
 
   const buildingFeature = files['building.geojson'].features[0];
   if (projectData.building?.placeId) {
     placeIdsByFeatureId.set(buildingFeature.id, projectData.building.placeId);
   }
-  for (const item of [...(projectData.levels || []), ...(projectData.units || [])]) {
+  for (const item of [...(projectData.levels || []), ...(projectData.units || []), ...(projectData.fixtures || [])]) {
     if (item.id && item.placeId) placeIdsByFeatureId.set(item.id, item.placeId);
   }
 
@@ -610,7 +627,7 @@ function generateMapFeaturesCSV(projectData) {
   };
 
   const rows = [['PlaceId', 'Name', 'Type', 'FeatureType', 'FeatureId', 'FeatureName', 'FeatureCategory']];
-  for (const filename of ['building.geojson', 'level.geojson', 'unit.geojson', 'section.geojson']) {
+  for (const filename of ['building.geojson', 'level.geojson', 'unit.geojson', 'section.geojson', 'fixture.geojson']) {
     if (!files[filename]) continue;
     for (const feature of files[filename].features) {
       const featureName = feature.properties.name?.en || '';

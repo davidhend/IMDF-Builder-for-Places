@@ -396,6 +396,8 @@ class IMDFBuilder {
                         <option value="stairs" ${data.category === 'stairs' ? 'selected' : ''}>Stairs</option>
                         <option value="wall" ${data.category === 'wall' ? 'selected' : ''}>Wall</option>
                         <option value="furniture" ${data.category === 'furniture' ? 'selected' : ''}>Furniture</option>
+                        <option value="desk" ${data.category === 'desk' ? 'selected' : ''}>Desk</option>
+                        <option value="equipment" ${data.category === 'equipment' ? 'selected' : ''}>Equipment</option>
                         <option value="door" ${data.category === 'door' ? 'selected' : ''}>Door</option>
                         <option value="unspecified" ${data.category === 'unspecified' ? 'selected' : ''}>Unspecified</option>
                     </select>
@@ -432,6 +434,15 @@ class IMDFBuilder {
                 <div class="property-field">
                     <label>Microsoft Places ID (optional):</label>
                     <input type="text" id="prop-placeid" value="${data.placeId || ''}" placeholder="${isSection ? 'Section PlaceId (not a Desk’s — desks locate via their Section)' : 'Room PlaceId from Get-PlaceV3'}" />
+                </div>
+            `;
+        } else if (this.fixtures.some(f => f.id === data.id)) {
+            // Bookable desks correlate to fixture features — set the Desk's
+            // PlaceId here (and category "Desk") to link this shape to it.
+            html += `
+                <div class="property-field">
+                    <label>Microsoft Places ID (optional):</label>
+                    <input type="text" id="prop-placeid" value="${data.placeId || ''}" placeholder="Desk PlaceId from Get-PlaceV3" />
                 </div>
             `;
         }
@@ -663,12 +674,17 @@ class IMDFBuilder {
         // 1 = open space (light or transparent), 0 = ink (walls, lines).
         // Thin lines are kept on purpose: door swing arcs are thin, and they
         // are what seals a doorway once the ink is dilated below.
+        // `mark` additionally captures faint strokes — CAD plans draw
+        // furniture in light gray, well above the wall-ink threshold — and
+        // feeds only the furniture detector, never room detection.
         let open = new Uint8Array(w * h);
+        const mark = new Uint8Array(w * h);
         for (let i = 0; i < w * h; i++) {
             const lum = px[i * 4 + 3] < 40
                 ? 255
                 : 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
             open[i] = lum > 180 ? 1 : 0;
+            mark[i] = lum <= 245 ? 1 : 0;
         }
 
         // Untouched copy of the binarized image: room regrowth (below) must
@@ -899,77 +915,137 @@ class IMDFBuilder {
             }
         }
 
-        // Furniture: free-standing ink clusters strictly inside the building
-        // (desks, tables, chairs are drawn as thin lines that rarely touch a
-        // wall). Nearby blobs — a desk and its chair — merge into one block.
+        // Furniture: ink that lives inside exactly one detected room. Wall
+        // ink always separates two rooms (or a room and the outside), so an
+        // ink pixel whose open neighbourhood belongs to a single accepted
+        // room is furniture — desks, chairs and tables, including ones drawn
+        // touching a wall. Nearby ink merges into one block per desk group.
         let furniture = 0;
-        if (bounds) {
-            const maxDimX = (bounds.maxX - bounds.minX) * 0.3;
-            const maxDimY = (bounds.maxY - bounds.minY) * 0.3;
-            // A blob whose bounding box swallows a detected room is a wall
-            // structure (an office block whose walls never touch the outer
-            // wall), not furniture — rooms sit inside walls, never inside desks.
-            const enclosesRoom = c => acceptedRegions.some(a =>
-                a.minX >= c.minX - 2 && a.maxX <= c.maxX + 2 &&
-                a.minY >= c.minY - 2 && a.maxY <= c.maxY + 2);
-            const cands = comps.filter(c => c.id !== bounds.id &&
-                c.count >= 6 && c.count <= imgArea * 0.01 &&
-                c.minX > bounds.minX && c.maxX < bounds.maxX &&
-                c.minY > bounds.minY && c.maxY < bounds.maxY &&
-                (c.maxX - c.minX) <= maxDimX && (c.maxY - c.minY) <= maxDimY &&
-                !enclosesRoom(c));
-            const gap = Math.max(3, sealRadius);
-            const used = new Array(cands.length).fill(false);
+        if (bounds && acceptedRegions.length) {
+            const acceptedLabel = new Uint8Array(nextLabel);
+            for (const r of acceptedRegions) acceptedLabel[r.label] = 1;
+
+            // Walls are thick strokes; furniture is hairline. Ink with a
+            // "core" (all four neighbours also ink) is structural — without
+            // this, the inner face of a thick outer wall reads as furniture
+            // because it only ever sees one room. The core is grown two
+            // pixels to also claim the wall's own boundary pixels.
+            let structural = new Uint8Array(w * h);
+            for (let y = 1; y < h - 1; y++) {
+                for (let x = 1; x < w - 1; x++) {
+                    const i = y * w + x;
+                    if (!openOrig[i] && !openOrig[i - 1] && !openOrig[i + 1] &&
+                        !openOrig[i - w] && !openOrig[i + w]) structural[i] = 1;
+                }
+            }
+            for (let pass = 0; pass < 2; pass++) {
+                const grown = new Uint8Array(structural);
+                for (let y = 1; y < h - 1; y++) {
+                    for (let x = 1; x < w - 1; x++) {
+                        const i = y * w + x;
+                        if (!structural[i] && (structural[i - 1] || structural[i + 1] ||
+                            structural[i - w] || structural[i + w])) grown[i] = 1;
+                    }
+                }
+                structural = grown;
+            }
+
+            const R = sealRadius + 2;
+            const furnMask = new Uint8Array(w * h);
+            for (let y = Math.max(1, bounds.minY); y <= Math.min(h - 2, bounds.maxY); y++) {
+                for (let x = Math.max(1, bounds.minX); x <= Math.min(w - 2, bounds.maxX); x++) {
+                    const i = y * w + x;
+                    if (!mark[i] || structural[i]) continue;
+                    let room = 0;
+                    let isFurniture = true;
+                    for (let dy = -R; dy <= R && isFurniture; dy++) {
+                        const yy = y + dy;
+                        if (yy < 0 || yy >= h) continue;
+                        for (let dx = -R; dx <= R; dx++) {
+                            const xx = x + dx;
+                            if (xx < 0 || xx >= w) continue;
+                            const l = label[yy * w + xx];
+                            if (l === -1) { isFurniture = false; break; }
+                            if (l > 0 && acceptedLabel[l]) {
+                                if (room === 0) room = l;
+                                else if (room !== l) { isFurniture = false; break; }
+                            }
+                        }
+                    }
+                    if (isFurniture && room) furnMask[i] = 1;
+                }
+            }
+
+            // Each connected furniture-ink cluster becomes its own traced
+            // polygon, so a desk renders as a desk-shaped block, a chair as a
+            // chair, a table as a table — no crude group boxes. Door swing
+            // arcs come through as thin arcs, which usefully marks doorways
+            // (Places rejects IMDF opening files, so this is the only way
+            // doors appear at all).
+            const fLabel = new Int32Array(w * h);
+            const fStack = [];
+            const clusters = [];
+            for (let start = 0; start < w * h; start++) {
+                if (!furnMask[start] || fLabel[start]) continue;
+                const id = clusters.length + 1;
+                const cl = { id, minX: w, minY: h, maxX: 0, maxY: 0, count: 0 };
+                fStack.push(start);
+                while (fStack.length) {
+                    const i = fStack.pop();
+                    if (i < 0 || i >= w * h || fLabel[i] || !furnMask[i]) continue;
+                    fLabel[i] = id;
+                    cl.count++;
+                    const x = i % w, y = (i / w) | 0;
+                    if (x < cl.minX) cl.minX = x;
+                    if (x > cl.maxX) cl.maxX = x;
+                    if (y < cl.minY) cl.minY = y;
+                    if (y > cl.maxY) cl.maxY = y;
+                    if (x > 0) fStack.push(i - 1);
+                    if (x < w - 1) fStack.push(i + 1);
+                    fStack.push(i - w, i + w);
+                }
+                clusters.push(cl);
+            }
+
+            const maxDimX = (bounds.maxX - bounds.minX) * 0.35;
+            const maxDimY = (bounds.maxY - bounds.minY) * 0.35;
             const coveredByFixture = (x, y) => this.fixtures.some(f => {
                 const o = f.fabricObject;
                 return o && o.width !== undefined && x >= o.left && x <= o.left + o.width * (o.scaleX || 1)
                          && y >= o.top && y <= o.top + o.height * (o.scaleY || 1);
             });
-            for (let i = 0; i < cands.length && furniture < 150; i++) {
-                if (used[i]) continue;
-                used[i] = true;
-                const cl = { minX: cands[i].minX, minY: cands[i].minY, maxX: cands[i].maxX, maxY: cands[i].maxY };
-                let grew = true;
-                while (grew) {
-                    grew = false;
-                    for (let j = 0; j < cands.length; j++) {
-                        if (used[j]) continue;
-                        const c = cands[j];
-                        if (c.minX <= cl.maxX + gap && c.maxX >= cl.minX - gap &&
-                            c.minY <= cl.maxY + gap && c.maxY >= cl.minY - gap) {
-                            used[j] = true;
-                            grew = true;
-                            if (c.minX < cl.minX) cl.minX = c.minX;
-                            if (c.maxX > cl.maxX) cl.maxX = c.maxX;
-                            if (c.minY < cl.minY) cl.minY = c.minY;
-                            if (c.maxY > cl.maxY) cl.maxY = c.maxY;
-                        }
-                    }
-                }
-                if (cl.maxX - cl.minX < 4 || cl.maxY - cl.minY < 4) continue;
-                const left = toCanvasX(cl.minX);
-                const top = toCanvasY(cl.minY);
-                const width = toCanvasX(cl.maxX + 1) - left;
-                const height = toCanvasY(cl.maxY + 1) - top;
-                if (coveredByFixture(left + width / 2, top + height / 2)) continue;
-
-                const rect = new fabric.Rect({
-                    left, top, width, height,
+            for (const cl of clusters.sort((a, b) => b.count - a.count)) {
+                if (furniture >= 400) break;
+                if (cl.count < 6) continue;
+                if (cl.maxX - cl.minX < 3 && cl.maxY - cl.minY < 3) continue;
+                if (cl.maxX - cl.minX > maxDimX || cl.maxY - cl.minY > maxDimY) continue;
+                const outline = this.traceMaskOutline(
+                    (x, y) => fLabel[y * w + x] === cl.id,
+                    cl.minX, cl.minY, cl.maxX, cl.maxY, w, h);
+                if (outline.length < 4) continue;
+                const points = this.simplifyPath(outline, 1)
+                    .map(([px, py]) => ({ x: toCanvasX(px), y: toCanvasY(py) }));
+                if (points.length < 3) continue;
+                const shape = new fabric.Polygon(points, {
                     fill: 'rgba(108, 117, 125, 0.35)',
                     stroke: '#6c757d',
-                    strokeWidth: 1
+                    strokeWidth: 1,
+                    objectCaching: false
                 });
+                if (coveredByFixture(shape.left + shape.width / 2, shape.top + shape.height / 2)) continue;
+
                 const fixture = {
                     id: this.generateUUID(),
                     name: `Furniture ${this.fixtures.length + 1}`,
                     category: 'furniture',
+                    placeId: null,
                     levelId: this.currentLevel.id,
                     geometryType: 'Polygon',
-                    fabricObject: rect
+                    fabricObject: shape
                 };
-                rect.imdfData = fixture;
+                shape.imdfData = fixture;
                 this.fixtures.push(fixture);
-                this.canvas.add(rect);
+                this.canvas.add(shape);
                 furniture++;
             }
         }
@@ -1249,6 +1325,7 @@ class IMDFBuilder {
                     id: f.id,
                     name: f.name || null,
                     category: f.category,
+                    placeId: f.placeId || null,
                     levelId: f.levelId,
                     geometryType: isLine ? 'LineString' : 'Polygon',
                     coordinates: isLine
