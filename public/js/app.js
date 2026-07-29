@@ -389,7 +389,8 @@ class IMDFBuilder {
                     <select id="prop-category">
                         <option value="room" ${data.category === 'room' ? 'selected' : ''}>Room</option>
                         <option value="office" ${data.category === 'office' ? 'selected' : ''}>Office</option>
-                        <option value="conference" ${data.category === 'conference' ? 'selected' : ''}>Conference Room</option>
+                        <option value="conferenceroom" ${data.category === 'conferenceroom' || data.category === 'conference' ? 'selected' : ''}>Conference Room</option>
+                        <option value="workspace" ${data.category === 'workspace' ? 'selected' : ''}>Workspace (Desk Pool)</option>
                         <option value="seating" ${data.category === 'seating' ? 'selected' : ''}>Seating</option>
                         <option value="restroom" ${data.category === 'restroom' ? 'selected' : ''}>Restroom</option>
                         <option value="elevator" ${data.category === 'elevator' ? 'selected' : ''}>Elevator</option>
@@ -1363,6 +1364,11 @@ class IMDFBuilder {
                     category: f.category,
                     placeId: f.placeId || null,
                     levelId: f.levelId,
+                    // Places' desk icon can be oriented via the documented
+                    // "rotation" fixture extension — taken from the shape's
+                    // rotation handle.
+                    rotation: !isLine && f.fabricObject && Math.round(f.fabricObject.angle || 0) !== 0
+                        ? Math.round(f.fabricObject.angle) : null,
                     geometryType: isLine ? 'LineString' : 'Polygon',
                     coordinates: isLine
                         ? this.getLineCoordinates(f.fabricObject)

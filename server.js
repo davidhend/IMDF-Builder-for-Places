@@ -418,6 +418,10 @@ function generateIMDFFiles(projectData) {
     }))
   };
 
+  // Places' recognized workplace categories are conferenceroom, workspace
+  // and desk; older projects saved meeting rooms as "conference".
+  const normalizeCategory = category => category === 'conference' ? 'conferenceroom' : category;
+
   // Units and sections share a shape; only the feature_type and file differ.
   const drawnFeature = (unit, featureType) => ({
     type: 'Feature',
@@ -428,7 +432,7 @@ function generateIMDFFiles(projectData) {
       coordinates: projectPolygon(unit.coordinates || [[[0, 0], [0, 0.001], [0.001, 0.001], [0.001, 0], [0, 0]]])
     },
     properties: {
-      category: unit.category || 'unspecified',
+      category: normalizeCategory(unit.category) || 'unspecified',
       // Default to unrestricted: "restricted" marks the room off-limits in Places.
       restriction: unit.restriction || null,
       name: toLabels(unit.name || 'Unit'),
@@ -499,8 +503,13 @@ function generateIMDFFiles(projectData) {
   // desk fixtures stay fixtures; furniture, walls and equipment are exported
   // as units, which is also how the docs frame units ("any space that is
   // represented with a polygon on the map", walls included).
-  const deskFixtures = fixtures.filter(f => (f.category || 'furniture') === 'desk');
-  const furnitureFixtures = fixtures.filter(f => (f.category || 'furniture') !== 'desk');
+  // A fixture correlated to a directory object is a bookable desk by
+  // definition (desks are the only thing fixtures correlate to), so it gets
+  // the desk category — and with it Places' auto-drawn desk icon — even if
+  // the category wasn't set by hand.
+  const isDesk = f => (f.category || 'furniture') === 'desk' || !!f.placeId;
+  const deskFixtures = fixtures.filter(isDesk);
+  const furnitureFixtures = fixtures.filter(f => !isDesk(f));
 
   // Shoelace centroid, computed relative to the first vertex — on raw
   // longitude/latitude values (magnitude ~100, polygon area ~1e-9) the
@@ -546,9 +555,12 @@ function generateIMDFFiles(projectData) {
       feature_type: 'fixture',
       geometry: { type: 'Polygon', coordinates: fixturePolygon(fixture) },
       properties: {
-        category: fixture.category || 'desk',
+        category: 'desk',
         name: toLabels(fixture.name),
-        level_id: fixture.levelId || null
+        level_id: fixture.levelId || null,
+        // Microsoft extension: orients the auto-drawn desk icon.
+        ...(Number.isFinite(fixture.rotation) && fixture.rotation !== 0
+          ? { rotation: fixture.rotation } : {})
       }
     }))
   };
@@ -590,7 +602,8 @@ const PLACES_PROPERTY_ALLOWLIST = {
   level: ['ordinal', 'category', 'restriction', 'outdoor', 'name', 'short_name', 'building_ids'],
   unit: ['category', 'restriction', 'name', 'alt_name', 'display_point', 'level_id'],
   section: ['category', 'restriction', 'name', 'alt_name', 'display_point', 'level_id'],
-  fixture: ['category', 'name', 'level_id']
+  // "rotation" is a documented Microsoft extension (orients the desk icon)
+  fixture: ['category', 'name', 'level_id', 'rotation']
 };
 const LABEL_PROPERTIES = ['name', 'alt_name', 'short_name'];
 
@@ -675,7 +688,7 @@ function generateMapFeaturesCSV(projectData) {
   // polygons only for units) — keep those rows out of the correlation CSV,
   // which the user edits by hand; nothing in the directory maps to them.
   const furnitureIds = new Set((projectData.fixtures || [])
-    .filter(f => (f.category || 'furniture') !== 'desk')
+    .filter(f => (f.category || 'furniture') !== 'desk' && !f.placeId)
     .map(f => f.id));
 
   const rows = [['PlaceId', 'Name', 'Type', 'FeatureType', 'FeatureId', 'FeatureName', 'FeatureCategory']];
