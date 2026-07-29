@@ -466,9 +466,9 @@ function generateIMDFFiles(projectData) {
     features: sections.map(s => drawnFeature(s, 'section'))
   };
 
-  // Generate fixture.geojson. IMDF fixtures are polygons: furniture traced by
-  // the client already is one; manually drawn wall/door lines are widened
-  // into thin strips, and legacy point fixtures become small squares.
+  // Fixture geometry. IMDF fixtures are polygons: furniture traced by the
+  // client already is one; manually drawn wall/door lines are widened into
+  // thin strips, and legacy point fixtures become small squares.
   const fixturePolygon = fixture => {
     const coords = fixture.coordinates;
     if (fixture.geometryType === 'Polygon' && Array.isArray(coords?.[0])) {
@@ -493,15 +493,60 @@ function generateIMDFFiles(projectData) {
       [px - r, py - r], [px + r, py - r], [px + r, py + r], [px - r, py + r], [px - r, py - r]
     ]]);
   };
+  // Places renders polygon shapes only for units — fixture features get an
+  // automatically drawn desk icon (with booking avatars) instead of their
+  // geometry, and everything else in fixture.geojson is invisible. So only
+  // desk fixtures stay fixtures; furniture, walls and equipment are exported
+  // as units, which is also how the docs frame units ("any space that is
+  // represented with a polygon on the map", walls included).
+  const deskFixtures = fixtures.filter(f => (f.category || 'furniture') === 'desk');
+  const furnitureFixtures = fixtures.filter(f => (f.category || 'furniture') !== 'desk');
+
+  // Shoelace centroid, computed relative to the first vertex — on raw
+  // longitude/latitude values (magnitude ~100, polygon area ~1e-9) the
+  // naive formula loses everything to floating-point cancellation.
+  const ringCentroid = ring => {
+    const [ox, oy] = ring[0];
+    let area = 0, cx = 0, cy = 0;
+    for (let i = 0; i < ring.length - 1; i++) {
+      const x1 = ring[i][0] - ox, y1 = ring[i][1] - oy;
+      const x2 = ring[i + 1][0] - ox, y2 = ring[i + 1][1] - oy;
+      const cross = x1 * y2 - x2 * y1;
+      area += cross;
+      cx += (x1 + x2) * cross;
+      cy += (y1 + y2) * cross;
+    }
+    return Math.abs(area) > 1e-18 ? [ox + cx / (3 * area), oy + cy / (3 * area)] : ring[0];
+  };
+  const furnitureUnitFeatures = furnitureFixtures.map(f => {
+    const rings = fixturePolygon(f);
+    return {
+      type: 'Feature',
+      id: f.id || randomUUID(),
+      feature_type: 'unit',
+      geometry: { type: 'Polygon', coordinates: rings },
+      properties: {
+        category: 'unspecified',
+        restriction: null,
+        name: toLabels(f.name || 'Furniture'),
+        alt_name: null,
+        display_point: { type: 'Point', coordinates: ringCentroid(rings[0]) },
+        level_id: f.levelId || null
+      }
+    };
+  });
+
+  unitFeatures.features.push(...furnitureUnitFeatures);
+
   const fixtureFeatures = {
     type: 'FeatureCollection',
-    features: fixtures.map(fixture => ({
+    features: deskFixtures.map(fixture => ({
       type: 'Feature',
       id: fixture.id || randomUUID(),
       feature_type: 'fixture',
       geometry: { type: 'Polygon', coordinates: fixturePolygon(fixture) },
       properties: {
-        category: fixture.category || 'furniture',
+        category: fixture.category || 'desk',
         name: toLabels(fixture.name),
         level_id: fixture.levelId || null
       }
@@ -522,7 +567,7 @@ function generateIMDFFiles(projectData) {
   if (sections.length > 0) {
     files['section.geojson'] = sectionFeatures;
   }
-  if (fixtures.length > 0) {
+  if (deskFixtures.length > 0) {
     files['fixture.geojson'] = fixtureFeatures;
   }
 
@@ -626,10 +671,18 @@ function generateMapFeaturesCSV(projectData) {
     return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
   };
 
+  // Furniture rides in unit.geojson purely for rendering (Places draws
+  // polygons only for units) — keep those rows out of the correlation CSV,
+  // which the user edits by hand; nothing in the directory maps to them.
+  const furnitureIds = new Set((projectData.fixtures || [])
+    .filter(f => (f.category || 'furniture') !== 'desk')
+    .map(f => f.id));
+
   const rows = [['PlaceId', 'Name', 'Type', 'FeatureType', 'FeatureId', 'FeatureName', 'FeatureCategory']];
   for (const filename of ['building.geojson', 'level.geojson', 'unit.geojson', 'section.geojson', 'fixture.geojson']) {
     if (!files[filename]) continue;
     for (const feature of files[filename].features) {
+      if (filename === 'unit.geojson' && furnitureIds.has(feature.id)) continue;
       const featureName = feature.properties.name?.en || '';
       const placeId = placeIdsByFeatureId.get(feature.id) || '';
       rows.push([
