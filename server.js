@@ -281,10 +281,18 @@ function generateIMDFFiles(projectData) {
   // degrees). Microsoft Places requires georeferenced geometry, so shift the
   // whole drawing onto the venue's real location by centring its bounding box
   // there. Canvas y grows downward, so it's flipped onto latitude.
+  // Traced outer wall from auto-trace (single ring, canvas units). When
+  // present it becomes the real footprint/level outline, and it anchors the
+  // physical-width fit so "Building Width" means the building, not the units.
+  const outlineRing = Array.isArray(building?.outline?.[0]) && building.outline[0].length >= 3
+    ? building.outline[0]
+    : null;
+
   const rings = [];
   for (const unit of units) {
     for (const ring of unit.coordinates || []) rings.push(ring);
   }
+  if (outlineRing) rings.push(outlineRing);
   if (rings.length === 0 && building?.coordinates) {
     for (const ring of building.coordinates) rings.push(ring);
   }
@@ -323,16 +331,25 @@ function generateIMDFFiles(projectData) {
     return i === 0 ? ensureCounterclockwise(projected) : projected;
   });
 
-  // Footprint = drawing bounding box plus a margin, so every unit falls inside it.
+  // Footprint = the traced building outline when auto-trace found one,
+  // otherwise the drawing bounding box plus a margin so every unit falls
+  // inside it.
+  const closeRing = ring => {
+    const first = ring[0];
+    const last = ring[ring.length - 1];
+    return (first[0] === last[0] && first[1] === last[1]) ? ring : [...ring, [first[0], first[1]]];
+  };
   const padX = Math.max((maxX - minX) * 0.1, 0.00005);
   const padY = Math.max((maxY - minY) * 0.1, 0.00005);
-  const footprintPolygon = projectPolygon([[
-    [minX - padX, minY - padY],
-    [minX - padX, maxY + padY],
-    [maxX + padX, maxY + padY],
-    [maxX + padX, minY - padY],
-    [minX - padX, minY - padY]
-  ]]);
+  const footprintPolygon = outlineRing
+    ? projectPolygon([closeRing(outlineRing)])
+    : projectPolygon([[
+        [minX - padX, minY - padY],
+        [minX - padX, maxY + padY],
+        [maxX + padX, maxY + padY],
+        [maxX + padX, minY - padY],
+        [minX - padX, minY - padY]
+      ]]);
 
   // Generate building.geojson — Microsoft Places requires building geometry to be null;
   // the building outline goes in footprint.geojson instead.
@@ -401,6 +418,10 @@ function generateIMDFFiles(projectData) {
     }))
   };
 
+  // Places' recognized workplace categories are conferenceroom, workspace
+  // and desk; older projects saved meeting rooms as "conference".
+  const normalizeCategory = category => category === 'conference' ? 'conferenceroom' : category;
+
   // Units and sections share a shape; only the feature_type and file differ.
   const drawnFeature = (unit, featureType) => ({
     type: 'Feature',
@@ -411,7 +432,7 @@ function generateIMDFFiles(projectData) {
       coordinates: projectPolygon(unit.coordinates || [[[0, 0], [0, 0.001], [0.001, 0.001], [0.001, 0], [0, 0]]])
     },
     properties: {
-      category: unit.category || 'unspecified',
+      category: normalizeCategory(unit.category) || 'unspecified',
       // Default to unrestricted: "restricted" marks the room off-limits in Places.
       restriction: unit.restriction || null,
       name: toLabels(unit.name || 'Unit'),
@@ -424,9 +445,24 @@ function generateIMDFFiles(projectData) {
     }
   });
 
+  // Sections render with no visible border in Microsoft Places, so each one
+  // also gets a coincident unit — the unit draws the outline, the section
+  // carries the desk-pool correlation. The twin's id is derived from the
+  // section id (last block inverted) so it stays stable across exports.
+  const twinUnitId = id => {
+    const base = String(id || randomUUID());
+    const tail = base.slice(24).split('').map(c => {
+      const n = parseInt(c, 16);
+      return Number.isNaN(n) ? c : (15 - n).toString(16);
+    }).join('');
+    return base.slice(0, 24) + tail;
+  };
   const unitFeatures = {
     type: 'FeatureCollection',
-    features: roomUnits.map(u => drawnFeature(u, 'unit'))
+    features: [
+      ...roomUnits.map(u => drawnFeature(u, 'unit')),
+      ...sections.map(s => drawnFeature({ ...s, id: twinUnitId(s.id), placeId: null }, 'unit'))
+    ]
   };
 
   const sectionFeatures = {
@@ -434,20 +470,97 @@ function generateIMDFFiles(projectData) {
     features: sections.map(s => drawnFeature(s, 'section'))
   };
 
-  // Generate fixture.geojson
+  // Fixture geometry. IMDF fixtures are polygons: furniture traced by the
+  // client already is one; manually drawn wall/door lines are widened into
+  // thin strips, and legacy point fixtures become small squares.
+  const fixturePolygon = fixture => {
+    const coords = fixture.coordinates;
+    if (fixture.geometryType === 'Polygon' && Array.isArray(coords?.[0])) {
+      return projectPolygon(coords);
+    }
+    if (Array.isArray(coords) && Array.isArray(coords[0]) && coords.length >= 2) {
+      const [x1, y1] = coords[0];
+      const [x2, y2] = coords[coords.length - 1];
+      const len = Math.hypot(x2 - x1, y2 - y1) || 1;
+      const half = 0.75 / 100000; // ~1.5 canvas px wide
+      const ox = (-(y2 - y1) / len) * half;
+      const oy = ((x2 - x1) / len) * half;
+      return projectPolygon([[
+        [x1 + ox, y1 + oy], [x2 + ox, y2 + oy],
+        [x2 - ox, y2 - oy], [x1 - ox, y1 - oy],
+        [x1 + ox, y1 + oy]
+      ]]);
+    }
+    const [px, py] = Array.isArray(coords) && typeof coords[0] === 'number' ? coords : [centerX, centerY];
+    const r = 1 / 100000;
+    return projectPolygon([[
+      [px - r, py - r], [px + r, py - r], [px + r, py + r], [px - r, py + r], [px - r, py - r]
+    ]]);
+  };
+  // Places renders polygon shapes only for units — fixture features get an
+  // automatically drawn desk icon (with booking avatars) instead of their
+  // geometry, and everything else in fixture.geojson is invisible. So only
+  // desk fixtures stay fixtures; furniture, walls and equipment are exported
+  // as units, which is also how the docs frame units ("any space that is
+  // represented with a polygon on the map", walls included).
+  // A fixture correlated to a directory object is a bookable desk by
+  // definition (desks are the only thing fixtures correlate to), so it gets
+  // the desk category — and with it Places' auto-drawn desk icon — even if
+  // the category wasn't set by hand.
+  const isDesk = f => (f.category || 'furniture') === 'desk' || !!f.placeId;
+  const deskFixtures = fixtures.filter(isDesk);
+  const furnitureFixtures = fixtures.filter(f => !isDesk(f));
+
+  // Shoelace centroid, computed relative to the first vertex — on raw
+  // longitude/latitude values (magnitude ~100, polygon area ~1e-9) the
+  // naive formula loses everything to floating-point cancellation.
+  const ringCentroid = ring => {
+    const [ox, oy] = ring[0];
+    let area = 0, cx = 0, cy = 0;
+    for (let i = 0; i < ring.length - 1; i++) {
+      const x1 = ring[i][0] - ox, y1 = ring[i][1] - oy;
+      const x2 = ring[i + 1][0] - ox, y2 = ring[i + 1][1] - oy;
+      const cross = x1 * y2 - x2 * y1;
+      area += cross;
+      cx += (x1 + x2) * cross;
+      cy += (y1 + y2) * cross;
+    }
+    return Math.abs(area) > 1e-18 ? [ox + cx / (3 * area), oy + cy / (3 * area)] : ring[0];
+  };
+  const furnitureUnitFeatures = furnitureFixtures.map(f => {
+    const rings = fixturePolygon(f);
+    return {
+      type: 'Feature',
+      id: f.id || randomUUID(),
+      feature_type: 'unit',
+      geometry: { type: 'Polygon', coordinates: rings },
+      properties: {
+        category: 'unspecified',
+        restriction: null,
+        name: toLabels(f.name || 'Furniture'),
+        alt_name: null,
+        display_point: { type: 'Point', coordinates: ringCentroid(rings[0]) },
+        level_id: f.levelId || null
+      }
+    };
+  });
+
+  unitFeatures.features.push(...furnitureUnitFeatures);
+
   const fixtureFeatures = {
     type: 'FeatureCollection',
-    features: fixtures.map(fixture => ({
+    features: deskFixtures.map(fixture => ({
       type: 'Feature',
       id: fixture.id || randomUUID(),
       feature_type: 'fixture',
-      geometry: (fixture.geometryType || 'Point') === 'Point'
-        ? { type: 'Point', coordinates: projectPoint(fixture.coordinates || [centerX, centerY]) }
-        : { type: fixture.geometryType, coordinates: projectPolygon(fixture.coordinates || []) },
+      geometry: { type: 'Polygon', coordinates: fixturePolygon(fixture) },
       properties: {
-        category: fixture.category || 'wall',
-        name: null,
-        level_id: fixture.levelId || null
+        category: 'desk',
+        name: toLabels(fixture.name),
+        level_id: fixture.levelId || null,
+        // Microsoft extension: orients the auto-drawn desk icon.
+        ...(Number.isFinite(fixture.rotation) && fixture.rotation !== 0
+          ? { rotation: fixture.rotation } : {})
       }
     }))
   };
@@ -466,7 +579,7 @@ function generateIMDFFiles(projectData) {
   if (sections.length > 0) {
     files['section.geojson'] = sectionFeatures;
   }
-  if (fixtures.length > 0) {
+  if (deskFixtures.length > 0) {
     files['fixture.geojson'] = fixtureFeatures;
   }
 
@@ -489,7 +602,8 @@ const PLACES_PROPERTY_ALLOWLIST = {
   level: ['ordinal', 'category', 'restriction', 'outdoor', 'name', 'short_name', 'building_ids'],
   unit: ['category', 'restriction', 'name', 'alt_name', 'display_point', 'level_id'],
   section: ['category', 'restriction', 'name', 'alt_name', 'display_point', 'level_id'],
-  fixture: ['category', 'name', 'level_id']
+  // "rotation" is a documented Microsoft extension (orients the desk icon)
+  fixture: ['category', 'name', 'level_id', 'rotation']
 };
 const LABEL_PROPERTIES = ['name', 'alt_name', 'short_name'];
 
@@ -553,13 +667,15 @@ function validatePlacesCompatibility(files) {
 function generateMapFeaturesCSV(projectData) {
   const files = generateIMDFFiles(projectData);
   const placeIdsByFeatureId = new Map();
-  const directoryTypes = { building: 'Building', level: 'Floor', unit: 'Room', section: 'Section' };
+  // Desks correlate to fixture features (the docs' correlation step covers
+  // "each building, floor, room, desk and desk pool").
+  const directoryTypes = { building: 'Building', level: 'Floor', unit: 'Room', section: 'Section', fixture: 'Desk' };
 
   const buildingFeature = files['building.geojson'].features[0];
   if (projectData.building?.placeId) {
     placeIdsByFeatureId.set(buildingFeature.id, projectData.building.placeId);
   }
-  for (const item of [...(projectData.levels || []), ...(projectData.units || [])]) {
+  for (const item of [...(projectData.levels || []), ...(projectData.units || []), ...(projectData.fixtures || [])]) {
     if (item.id && item.placeId) placeIdsByFeatureId.set(item.id, item.placeId);
   }
 
@@ -568,10 +684,18 @@ function generateMapFeaturesCSV(projectData) {
     return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
   };
 
+  // Furniture rides in unit.geojson purely for rendering (Places draws
+  // polygons only for units) — keep those rows out of the correlation CSV,
+  // which the user edits by hand; nothing in the directory maps to them.
+  const furnitureIds = new Set((projectData.fixtures || [])
+    .filter(f => (f.category || 'furniture') !== 'desk' && !f.placeId)
+    .map(f => f.id));
+
   const rows = [['PlaceId', 'Name', 'Type', 'FeatureType', 'FeatureId', 'FeatureName', 'FeatureCategory']];
-  for (const filename of ['building.geojson', 'level.geojson', 'unit.geojson', 'section.geojson']) {
+  for (const filename of ['building.geojson', 'level.geojson', 'unit.geojson', 'section.geojson', 'fixture.geojson']) {
     if (!files[filename]) continue;
     for (const feature of files[filename].features) {
+      if (filename === 'unit.geojson' && furnitureIds.has(feature.id)) continue;
       const featureName = feature.properties.name?.en || '';
       const placeId = placeIdsByFeatureId.get(feature.id) || '';
       rows.push([

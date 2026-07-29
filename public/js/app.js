@@ -108,7 +108,13 @@ class IMDFBuilder {
         this.canvas.on('selection:created', (e) => this.handleSelection(e));
         this.canvas.on('selection:updated', (e) => this.handleSelection(e));
         this.canvas.on('selection:cleared', () => this.clearSelection());
-        this.canvas.on('mouse:down', (e) => this.handleCanvasClick(e));
+        this.canvas.on('mouse:down', (e) => {
+            if (e.e && e.e.altKey) {
+                this.cycleSelectionUnderPointer(e);
+                return;
+            }
+            this.handleCanvasClick(e);
+        });
 
         // Live pixel readout while dragging or resizing a shape.
         this.canvas.on('object:moving', (e) => this.showObjectMetrics(e.target));
@@ -339,6 +345,24 @@ class IMDFBuilder {
         }
     }
 
+    // Alt+click cycles through overlapping shapes under the cursor, so a
+    // shape buried beneath another (a desk fixture under a furniture piece,
+    // a room under a section) can still be selected and moved.
+    cycleSelectionUnderPointer(event) {
+        const pointer = this.canvas.getPointer(event.e);
+        const point = new fabric.Point(pointer.x, pointer.y);
+        const hits = this.canvas.getObjects()
+            .filter(o => o.selectable !== false && o.imdfData && o.containsPoint(point))
+            .reverse(); // topmost first, then progressively deeper
+        if (hits.length === 0) return;
+        const active = this.canvas.getActiveObject();
+        const next = hits[(hits.indexOf(active) + 1) % hits.length];
+        this.canvas.setActiveObject(next);
+        this.canvas.renderAll();
+        const name = next.imdfData.name || next.imdfData.category || 'shape';
+        this.updateCanvasInfo(`Selected "${name}" — Alt+click again for the shape beneath`);
+    }
+
     showObjectMetrics(obj) {
         if (!obj || !obj.imdfData) return;
         const w = Math.round((obj.width || 0) * (obj.scaleX || 1));
@@ -389,12 +413,16 @@ class IMDFBuilder {
                     <select id="prop-category">
                         <option value="room" ${data.category === 'room' ? 'selected' : ''}>Room</option>
                         <option value="office" ${data.category === 'office' ? 'selected' : ''}>Office</option>
-                        <option value="conference" ${data.category === 'conference' ? 'selected' : ''}>Conference Room</option>
+                        <option value="conferenceroom" ${data.category === 'conferenceroom' || data.category === 'conference' ? 'selected' : ''}>Conference Room</option>
+                        <option value="workspace" ${data.category === 'workspace' ? 'selected' : ''}>Workspace (Desk Pool)</option>
                         <option value="seating" ${data.category === 'seating' ? 'selected' : ''}>Seating</option>
                         <option value="restroom" ${data.category === 'restroom' ? 'selected' : ''}>Restroom</option>
                         <option value="elevator" ${data.category === 'elevator' ? 'selected' : ''}>Elevator</option>
                         <option value="stairs" ${data.category === 'stairs' ? 'selected' : ''}>Stairs</option>
                         <option value="wall" ${data.category === 'wall' ? 'selected' : ''}>Wall</option>
+                        <option value="furniture" ${data.category === 'furniture' ? 'selected' : ''}>Furniture</option>
+                        <option value="desk" ${data.category === 'desk' ? 'selected' : ''}>Desk</option>
+                        <option value="equipment" ${data.category === 'equipment' ? 'selected' : ''}>Equipment</option>
                         <option value="door" ${data.category === 'door' ? 'selected' : ''}>Door</option>
                         <option value="unspecified" ${data.category === 'unspecified' ? 'selected' : ''}>Unspecified</option>
                     </select>
@@ -431,6 +459,15 @@ class IMDFBuilder {
                 <div class="property-field">
                     <label>Microsoft Places ID (optional):</label>
                     <input type="text" id="prop-placeid" value="${data.placeId || ''}" placeholder="${isSection ? 'Section PlaceId (not a Desk’s — desks locate via their Section)' : 'Room PlaceId from Get-PlaceV3'}" />
+                </div>
+            `;
+        } else if (this.fixtures.some(f => f.id === data.id)) {
+            // Bookable desks correlate to fixture features — set the Desk's
+            // PlaceId here (and category "Desk") to link this shape to it.
+            html += `
+                <div class="property-field">
+                    <label>Microsoft Places ID (optional):</label>
+                    <input type="text" id="prop-placeid" value="${data.placeId || ''}" placeholder="Desk PlaceId from Get-PlaceV3" />
                 </div>
             `;
         }
@@ -474,8 +511,11 @@ class IMDFBuilder {
             const w = parseFloat(document.getElementById('prop-w').value);
             const h = parseFloat(document.getElementById('prop-h').value);
             if ([x, y, w, h].every(Number.isFinite) && w > 0 && h > 0) {
-                data.fabricObject.set({ left: x, top: y, width: w, height: h, scaleX: 1, scaleY: 1 });
-                data.fabricObject.setCoords();
+                // Resize via scale, not width/height: polygon dimensions are
+                // derived from their points and must not be set directly.
+                const obj = data.fabricObject;
+                obj.set({ left: x, top: y, scaleX: w / obj.width, scaleY: h / obj.height });
+                obj.setCoords();
                 this.canvas.renderAll();
                 this.showObjectMetrics(data.fabricObject);
             } else {
@@ -623,10 +663,15 @@ class IMDFBuilder {
         this.updateCounts();
     }
 
-    // Detect enclosed rooms on the uploaded floor plan and add an editable
-    // unit box for each. Pure pixel work: binarize, swallow hair-thin
-    // furniture lines, flood away everything connected to the image border,
-    // then take each remaining connected open region as a room candidate.
+    // Detect the floor plan's structure and add editable shapes: rooms as
+    // boxes or wall-following polygons, the outer wall as the footprint
+    // outline, and furniture (desks, chairs, tables — light-gray or dark,
+    // free-standing or pushed against a wall) as traced fixture polygons.
+    // Walls are identified geometrically — thick strokes, plus long straight
+    // hairlines attached to the wall network — so furniture ink never
+    // fragments a room, and doorways are sealed by bridging straight gaps
+    // between wall runs. All size thresholds are relative to the detected
+    // building, so page margins and export scale don't change the result.
     autoTraceRooms() {
         if (!this.currentLevel) {
             alert('Please add and select a level first');
@@ -640,75 +685,181 @@ class IMDFBuilder {
         const el = bg.getElement ? bg.getElement() : bg._element;
         const iw = el.naturalWidth || el.width;
         const ih = el.naturalHeight || el.height;
-        const maxDim = 900;
-        const s = Math.min(1, maxDim / Math.max(iw, ih));
-        const w = Math.max(1, Math.round(iw * s));
-        const h = Math.max(1, Math.round(ih * s));
+        const maxDim = 1200;
 
-        const off = document.createElement('canvas');
-        off.width = w;
-        off.height = h;
-        const ctx = off.getContext('2d', { willReadFrequently: true });
-        ctx.drawImage(el, 0, 0, w, h);
-        const px = ctx.getImageData(0, 0, w, h).data;
+        // Binarize at a given scale and label ink blobs; the largest blob is
+        // the wall network and its bounding box bounds the building. `ink`
+        // holds dark strokes; `mark` also captures faint ones (light-gray
+        // furniture) and feeds only the furniture detector.
+        const analyze = (scale) => {
+            const aw = Math.max(1, Math.round(iw * scale));
+            const ah = Math.max(1, Math.round(ih * scale));
+            const off = document.createElement('canvas');
+            off.width = aw;
+            off.height = ah;
+            const ctx = off.getContext('2d', { willReadFrequently: true });
+            ctx.drawImage(el, 0, 0, aw, ah);
+            const px = ctx.getImageData(0, 0, aw, ah).data;
 
-        // 1 = open space (light or transparent), 0 = ink (walls, lines).
-        // Thin lines are kept on purpose: door swing arcs are thin, and they
-        // are what seals a doorway once the ink is dilated below.
-        let open = new Uint8Array(w * h);
-        for (let i = 0; i < w * h; i++) {
-            const lum = px[i * 4 + 3] < 40
-                ? 255
-                : 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
-            open[i] = lum > 180 ? 1 : 0;
-        }
-
-        // Building bounds = bounding box of the largest connected ink blob
-        // (the outer wall). Rooms live inside it; dashed construction marks,
-        // title text and dimension lines outside it get filtered away.
-        const inkLabel = new Uint8Array(w * h);
-        const inkStack = [];
-        let bounds = null;
-        for (let start = 0; start < w * h; start++) {
-            if (open[start] || inkLabel[start]) continue;
-            let minX = w, minY = h, maxX = 0, maxY = 0, count = 0;
-            inkStack.push(start);
-            while (inkStack.length) {
-                const i = inkStack.pop();
-                if (i < 0 || i >= w * h || inkLabel[i] || open[i]) continue;
-                inkLabel[i] = 1;
-                count++;
-                const x = i % w, y = (i / w) | 0;
-                if (x < minX) minX = x;
-                if (x > maxX) maxX = x;
-                if (y < minY) minY = y;
-                if (y > maxY) maxY = y;
-                if (x > 0) inkStack.push(i - 1);
-                if (x < w - 1) inkStack.push(i + 1);
-                inkStack.push(i - w, i + w);
+            const ink = new Uint8Array(aw * ah);
+            const mark = new Uint8Array(aw * ah);
+            for (let i = 0; i < aw * ah; i++) {
+                const lum = px[i * 4 + 3] < 40
+                    ? 255
+                    : 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
+                if (lum <= 180) ink[i] = 1;
+                if (lum <= 245) mark[i] = 1;
             }
-            if (!bounds || count > bounds.count) bounds = { minX, minY, maxX, maxY, count };
-        }
 
-        // Dilate the ink to seal door openings (door leaf + swing arc close
-        // the gap once thickened). Boxes are grown back by the same amount.
-        const sealRadius = Math.max(2, Math.round(Math.max(w, h) / 300));
-        for (let pass = 0; pass < sealRadius; pass++) {
-            const eroded = new Uint8Array(open);
-            for (let y = 0; y < h; y++) {
-                for (let x = 0; x < w; x++) {
-                    const i = y * w + x;
-                    if (open[i] && (
-                        (x > 0 && !open[i - 1]) || (x < w - 1 && !open[i + 1]) ||
-                        (y > 0 && !open[i - w]) || (y < h - 1 && !open[i + w]))) {
-                        eroded[i] = 0;
-                    }
+            const inkComp = new Int32Array(aw * ah);
+            const comps = [{}];
+            const inkStack = [];
+            let bounds = null;
+            for (let start = 0; start < aw * ah; start++) {
+                if (!ink[start] || inkComp[start]) continue;
+                const c = { id: comps.length, minX: aw, minY: ah, maxX: 0, maxY: 0, count: 0 };
+                inkStack.push(start);
+                while (inkStack.length) {
+                    const i = inkStack.pop();
+                    if (i < 0 || i >= aw * ah || inkComp[i] || !ink[i]) continue;
+                    inkComp[i] = c.id;
+                    c.count++;
+                    const x = i % aw, y = (i / aw) | 0;
+                    if (x < c.minX) c.minX = x;
+                    if (x > c.maxX) c.maxX = x;
+                    if (y < c.minY) c.minY = y;
+                    if (y > c.maxY) c.maxY = y;
+                    if (x > 0) inkStack.push(i - 1);
+                    if (x < aw - 1) inkStack.push(i + 1);
+                    inkStack.push(i - aw, i + aw);
+                }
+                comps.push(c);
+                if (!bounds || c.count > bounds.count) bounds = c;
+            }
+            return { w: aw, h: ah, ink, mark, inkComp, comps, bounds };
+        };
+
+        // Two-pass: if the plan sits inside wide page margins, rescan at a
+        // scale where the building itself gets ~1000px.
+        let s = Math.min(1, maxDim / Math.max(iw, ih));
+        let A = analyze(s);
+        if (A.bounds) {
+            const buildingMaxImg = Math.max(
+                A.bounds.maxX - A.bounds.minX,
+                A.bounds.maxY - A.bounds.minY) / s;
+            const s2 = Math.min(1, 1000 / Math.max(buildingMaxImg, 1));
+            if (s2 > s * 1.15 && iw * s2 * ih * s2 < 4.2e6) {
+                s = s2;
+                A = analyze(s);
+            }
+        }
+        const { w, h, ink, mark, inkComp, comps, bounds } = A;
+        if (!bounds) {
+            alert('No drawing was detected on the floor plan image.');
+            return;
+        }
+        const bW = bounds.maxX - bounds.minX + 1;
+        const bH = bounds.maxY - bounds.minY + 1;
+        const bMax = Math.max(bW, bH);
+        const bboxArea = bW * bH;
+
+        // Structural ink = walls. Thick strokes (a pixel whose 4 neighbours
+        // are all ink) are always walls; hairline partitions are long
+        // straight runs in a component that also contains thick wall ink.
+        // Furniture strokes are short and thin, so they never qualify.
+        const thickCore = new Uint8Array(w * h);
+        for (let y = 1; y < h - 1; y++) {
+            for (let x = 1; x < w - 1; x++) {
+                const i = y * w + x;
+                if (ink[i] && ink[i - 1] && ink[i + 1] && ink[i - w] && ink[i + w]) thickCore[i] = 1;
+            }
+        }
+        const hasCore = new Uint8Array(comps.length + 1);
+        for (let i = 0; i < w * h; i++) if (thickCore[i]) hasCore[inkComp[i]] = 1;
+
+        const lMin = Math.max(20, Math.round(bMax / 28));
+        const runH = new Int32Array(w * h);
+        const runV = new Int32Array(w * h);
+        for (let y = 0; y < h; y++) {
+            let start = -1;
+            for (let x = 0; x <= w; x++) {
+                const on = x < w && ink[y * w + x];
+                if (on && start < 0) start = x;
+                if (!on && start >= 0) {
+                    const len = x - start;
+                    for (let k = start; k < x; k++) runH[y * w + k] = len;
+                    start = -1;
                 }
             }
-            open = eroded;
+        }
+        for (let x = 0; x < w; x++) {
+            let start = -1;
+            for (let y = 0; y <= h; y++) {
+                const on = y < h && ink[y * w + x];
+                if (on && start < 0) start = y;
+                if (!on && start >= 0) {
+                    const len = y - start;
+                    for (let k = start; k < y; k++) runV[k * w + x] = len;
+                    start = -1;
+                }
+            }
+        }
+        let structural = new Uint8Array(w * h);
+        for (let i = 0; i < w * h; i++) {
+            if (!ink[i]) continue;
+            if (thickCore[i] ||
+                (Math.max(runH[i], runV[i]) >= lMin && hasCore[inkComp[i]])) structural[i] = 1;
+        }
+        {   // grow by one pixel to swallow anti-aliasing halos
+            const grown = new Uint8Array(structural);
+            for (let y = 1; y < h - 1; y++) {
+                for (let x = 1; x < w - 1; x++) {
+                    const i = y * w + x;
+                    if (!structural[i] && (structural[i - 1] || structural[i + 1] ||
+                        structural[i - w] || structural[i + w])) grown[i] = 1;
+                }
+            }
+            structural = grown;
         }
 
-        // Flood from the borders: everything reachable is outside the building.
+        // Seal doorways: bridge straight gaps ≤ ~1.2m between wall runs,
+        // row-wise and column-wise. Furniture isn't structural, so it never
+        // partitions a room.
+        const gapMax = Math.max(8, Math.round(bMax / 40));
+        const closed = new Uint8Array(structural);
+        for (let y = 0; y < h; y++) {
+            let runEnd = -1, runLen = 0;
+            for (let x = 0; x < w; x++) {
+                const i = y * w + x;
+                if (structural[i]) {
+                    if (runEnd >= 0 && x - runEnd - 1 >= 1 && x - runEnd - 1 <= gapMax && runLen >= 3) {
+                        let len = 0;
+                        while (x + len < w && structural[y * w + x + len]) len++;
+                        if (len >= 3) for (let k = runEnd + 1; k < x; k++) closed[y * w + k] = 1;
+                    }
+                    runLen = (x > 0 && structural[i - 1]) ? runLen + 1 : 1;
+                    runEnd = x;
+                }
+            }
+        }
+        for (let x = 0; x < w; x++) {
+            let runEnd = -1, runLen = 0;
+            for (let y = 0; y < h; y++) {
+                const i = y * w + x;
+                if (structural[i]) {
+                    if (runEnd >= 0 && y - runEnd - 1 >= 1 && y - runEnd - 1 <= gapMax && runLen >= 3) {
+                        let len = 0;
+                        while (y + len < h && structural[(y + len) * w + x]) len++;
+                        if (len >= 3) for (let k = runEnd + 1; k < y; k++) closed[k * w + x] = 1;
+                    }
+                    runLen = (y > 0 && structural[i - w]) ? runLen + 1 : 1;
+                    runEnd = y;
+                }
+            }
+        }
+
+        // Flood from the borders: everything reachable is outside. Remaining
+        // open regions (walls sealed, furniture floodable) are rooms.
         const label = new Int32Array(w * h);
         const stack = [];
         for (let x = 0; x < w; x++) stack.push(x, (h - 1) * w + x);
@@ -717,7 +868,7 @@ class IMDFBuilder {
             let minX = w, minY = h, maxX = 0, maxY = 0, count = 0;
             while (stack.length) {
                 const i = stack.pop();
-                if (i < 0 || i >= w * h || label[i] !== 0 || !open[i]) continue;
+                if (i < 0 || i >= w * h || label[i] !== 0 || closed[i]) continue;
                 label[i] = seedLabel;
                 count++;
                 const x = i % w;
@@ -735,14 +886,15 @@ class IMDFBuilder {
             return { minX, minY, maxX, maxY, count };
         };
         flood(-1, false);
-
-        // Remaining open regions are enclosed spaces: room candidates.
         const regions = [];
         let nextLabel = 1;
         for (let start = 0; start < w * h; start++) {
-            if (label[start] === 0 && open[start]) {
+            if (label[start] === 0 && !closed[start]) {
                 stack.push(start);
-                regions.push(flood(nextLabel++, true));
+                const r = flood(nextLabel, true);
+                r.label = nextLabel;
+                regions.push(r);
+                nextLabel++;
             }
         }
 
@@ -758,32 +910,55 @@ class IMDFBuilder {
                      && cy >= o.top && cy <= o.top + o.height * o.scaleY;
         });
 
-        const imgArea = w * h;
-        const tol = sealRadius + 2;
+        const tol = gapMax;
+        const unitStyle = {
+            fill: 'rgba(0, 120, 212, 0.3)',
+            stroke: '#0078d4',
+            strokeWidth: 2
+        };
         let added = 0;
-        let skipped = 0;
+        let polygons = 0;
+        const acceptedRegions = [];
         for (const r of regions.sort((a, b) => b.count - a.count)) {
-            if (added >= 80) break;
+            if (added >= 150) break;
             const bw = r.maxX - r.minX + 1;
             const bh = r.maxY - r.minY + 1;
-            const areaFraction = r.count / imgArea;
-            if (areaFraction < 0.0015 || areaFraction > 0.35) continue; // noise / whole floor
+            const buildingFraction = r.count / bboxArea;
+            if (buildingFraction < 0.0024 || buildingFraction > 0.6) continue; // noise / whole floor
             if (bw < 6 || bh < 6) continue;
-            if (bounds && (r.minX < bounds.minX - tol || r.maxX > bounds.maxX + tol ||
-                           r.minY < bounds.minY - tol || r.maxY > bounds.maxY + tol)) continue;
-            if (r.count / (bw * bh) < 0.5) { skipped++; continue; }     // corridors, L-shapes
-            const left = toCanvasX(r.minX - sealRadius);
-            const top = toCanvasY(r.minY - sealRadius);
-            const width = toCanvasX(r.maxX + 1 + sealRadius) - left;
-            const height = toCanvasY(r.maxY + 1 + sealRadius) - top;
-            if (coveredByExisting(left + width / 2, top + height / 2)) continue;
+            if (r.minX < bounds.minX - tol || r.maxX > bounds.maxX + tol ||
+                r.minY < bounds.minY - tol || r.maxY > bounds.maxY + tol) continue;
 
-            const rect = new fabric.Rect({
-                left, top, width, height,
-                fill: 'rgba(0, 120, 212, 0.3)',
-                stroke: '#0078d4',
-                strokeWidth: 2
-            });
+            // Near-full boxes stay rectangles (easiest to edit); corridors and
+            // L-shaped rooms get a polygon traced along their actual walls.
+            let shape;
+            if (r.count / (bw * bh) >= 0.92) {
+                const left = toCanvasX(r.minX);
+                const top = toCanvasY(r.minY);
+                shape = new fabric.Rect({
+                    left, top,
+                    width: toCanvasX(r.maxX + 1) - left,
+                    height: toCanvasY(r.maxY + 1) - top,
+                    ...unitStyle
+                });
+            } else {
+                const outline = this.traceMaskOutline(
+                    (x, y) => label[y * w + x] === r.label,
+                    r.minX, r.minY, r.maxX, r.maxY, w, h);
+                if (outline.length < 4) continue;
+                const points = this.simplifyPath(outline, 1.5)
+                    .map(([px2, py2]) => ({ x: toCanvasX(px2), y: toCanvasY(py2) }));
+                if (points.length < 3) continue;
+                shape = new fabric.Polygon(points, { ...unitStyle, objectCaching: false });
+                polygons++;
+            }
+            const cx = shape.left + (shape.width * (shape.scaleX || 1)) / 2;
+            const cy = shape.top + (shape.height * (shape.scaleY || 1)) / 2;
+            if (coveredByExisting(cx, cy)) {
+                if (shape.type === 'polygon') polygons--;
+                continue;
+            }
+
             const unit = {
                 id: this.generateUUID(),
                 name: `Room ${this.units.length + 1}`,
@@ -792,24 +967,253 @@ class IMDFBuilder {
                 restriction: null,
                 placeId: null,
                 levelId: this.currentLevel.id,
-                fabricObject: rect
+                fabricObject: shape
             };
-            rect.imdfData = unit;
+            shape.imdfData = unit;
             this.units.push(unit);
-            this.canvas.add(rect);
+            this.canvas.add(shape);
+            acceptedRegions.push(r);
             added++;
+        }
+
+        // Trace the building's outer wall, starting from the topmost wall
+        // pixel (thin exterior ink can be claimed by the outside flood, so
+        // only a structural pixel is safely inside the mask). Exported as
+        // the footprint/level outline.
+        {
+            let sx = -1, sy = -1;
+            for (let y = bounds.minY; y <= bounds.maxY && sx < 0; y++) {
+                for (let x = bounds.minX; x <= bounds.maxX; x++) {
+                    if (closed[y * w + x]) { sx = x; sy = y; break; }
+                }
+            }
+            if (sx >= 0) {
+                const outline = this.traceMaskOutline(
+                    (x, y) => x >= bounds.minX && x <= bounds.maxX &&
+                              y >= bounds.minY && y <= bounds.maxY &&
+                              label[y * w + x] !== -1,
+                    bounds.minX, bounds.minY, bounds.maxX, bounds.maxY, w, h, sx, sy);
+                if (outline.length >= 4) {
+                    const points = this.simplifyPath(outline, 2)
+                        .map(([px2, py2]) => ({ x: toCanvasX(px2), y: toCanvasY(py2) }));
+                    if (points.length >= 3) this.setBuildingOutline(points);
+                }
+            }
+        }
+
+        // Furniture: visible strokes (light or dark) inside an accepted room
+        // that aren't walls, plus freestanding thick structures that sit as
+        // an island inside exactly one room (cubicle banks, solid tables,
+        // panel grids). Each connected cluster becomes its own traced
+        // polygon, so a desk renders desk-shaped. Door swing arcs come
+        // through as thin arcs — Places rejects IMDF opening files, so this
+        // is the only way doorways show at all.
+        let furniture = 0;
+        if (acceptedRegions.length) {
+            const acceptedLabel = new Uint8Array(nextLabel);
+            for (const r of acceptedRegions) acceptedLabel[r.label] = 1;
+            const furnMask = new Uint8Array(w * h);
+            for (let i = 0; i < w * h; i++) {
+                if (mark[i] && !structural[i] && !closed[i] && label[i] > 0 && acceptedLabel[label[i]]) furnMask[i] = 1;
+            }
+
+            const adjRoom = new Int32Array(comps.length + 1); // 0 none, -2 mixed/outside, else room label
+            for (let y = 1; y < h - 1; y++) {
+                for (let x = 1; x < w - 1; x++) {
+                    const i = y * w + x;
+                    if (!ink[i]) continue;
+                    const c = inkComp[i];
+                    if (c === bounds.id || adjRoom[c] === -2) continue;
+                    for (const n of [i - 1, i + 1, i - w, i + w]) {
+                        const l = label[n];
+                        if (l === -1) { adjRoom[c] = -2; break; }
+                        if (l > 0 && acceptedLabel[l]) {
+                            if (adjRoom[c] === 0) adjRoom[c] = l;
+                            else if (adjRoom[c] !== l) { adjRoom[c] = -2; break; }
+                        }
+                    }
+                }
+            }
+            let hasIslands = false;
+            for (let c = 1; c < adjRoom.length; c++) if (adjRoom[c] > 0) hasIslands = true;
+            if (hasIslands) {
+                for (let i = 0; i < w * h; i++) {
+                    if (ink[i] && adjRoom[inkComp[i]] > 0) furnMask[i] = 1;
+                }
+            }
+
+            const fLabel = new Int32Array(w * h);
+            const fStack = [];
+            const clusters = [];
+            for (let start = 0; start < w * h; start++) {
+                if (!furnMask[start] || fLabel[start]) continue;
+                const id = clusters.length + 1;
+                const cl = { id, minX: w, minY: h, maxX: 0, maxY: 0, count: 0 };
+                fStack.push(start);
+                while (fStack.length) {
+                    const i = fStack.pop();
+                    if (i < 0 || i >= w * h || fLabel[i] || !furnMask[i]) continue;
+                    fLabel[i] = id;
+                    cl.count++;
+                    const x = i % w, y = (i / w) | 0;
+                    if (x < cl.minX) cl.minX = x;
+                    if (x > cl.maxX) cl.maxX = x;
+                    if (y < cl.minY) cl.minY = y;
+                    if (y > cl.maxY) cl.maxY = y;
+                    if (x > 0) fStack.push(i - 1);
+                    if (x < w - 1) fStack.push(i + 1);
+                    fStack.push(i - w, i + w);
+                }
+                clusters.push(cl);
+            }
+
+            const minInk = Math.max(6, Math.round(bboxArea / 80000));
+            const maxDimX = bW * 0.35;
+            const maxDimY = bH * 0.35;
+            const coveredByFixture = (x, y) => this.fixtures.some(f => {
+                const o = f.fabricObject;
+                return o && o.width !== undefined && x >= o.left && x <= o.left + o.width * (o.scaleX || 1)
+                         && y >= o.top && y <= o.top + o.height * (o.scaleY || 1);
+            });
+            for (const cl of clusters.sort((a, b) => b.count - a.count)) {
+                if (furniture >= 400) break;
+                if (cl.count < minInk) continue;
+                if (cl.maxX - cl.minX < 3 && cl.maxY - cl.minY < 3) continue;
+                if (cl.maxX - cl.minX > maxDimX || cl.maxY - cl.minY > maxDimY) continue;
+                const outline = this.traceMaskOutline(
+                    (x, y) => fLabel[y * w + x] === cl.id,
+                    cl.minX, cl.minY, cl.maxX, cl.maxY, w, h);
+                if (outline.length < 4) continue;
+                const points = this.simplifyPath(outline, 1)
+                    .map(([px2, py2]) => ({ x: toCanvasX(px2), y: toCanvasY(py2) }));
+                if (points.length < 3) continue;
+                const shape = new fabric.Polygon(points, {
+                    fill: 'rgba(108, 117, 125, 0.35)',
+                    stroke: '#6c757d',
+                    strokeWidth: 1,
+                    objectCaching: false
+                });
+                if (coveredByFixture(shape.left + shape.width / 2, shape.top + shape.height / 2)) continue;
+
+                const fixture = {
+                    id: this.generateUUID(),
+                    name: `Furniture ${this.fixtures.length + 1}`,
+                    category: 'furniture',
+                    placeId: null,
+                    levelId: this.currentLevel.id,
+                    geometryType: 'Polygon',
+                    fabricObject: shape
+                };
+                shape.imdfData = fixture;
+                this.fixtures.push(fixture);
+                this.canvas.add(shape);
+                furniture++;
+            }
         }
 
         this.canvas.renderAll();
         this.updateCounts();
-        if (added === 0) {
-            alert('No enclosed rooms were detected' + (skipped ? ` (${skipped} irregular region(s) skipped)` : '') +
-                  '. Rooms already covered by existing boxes are left alone; otherwise try drawing manually.');
+        if (added === 0 && furniture === 0) {
+            alert('No enclosed rooms were detected. Rooms already covered by existing boxes are left alone; otherwise try drawing manually.');
         } else {
-            alert(`Auto-trace added ${added} box(es).` +
-                  (skipped ? ` ${skipped} irregular region(s) (corridors / L-shapes) were skipped — draw those by hand.` : '') +
-                  ' Move, resize, rename, or convert any box to a Section afterwards.');
+            alert(`Auto-trace added ${added} room(s)` +
+                  (polygons ? ` (${polygons} traced as wall-following polygons)` : '') +
+                  (furniture ? `, ${furniture} furniture piece(s)` : '') +
+                  (this.buildingOutline ? ', and the building outline (exported as the footprint)' : '') +
+                  '. Move, resize, rename, or delete any shape afterwards.');
         }
+    }
+
+    // Walk the crack between inside and outside pixels (marching-squares
+    // style): every boundary edge of the mask becomes a directed segment
+    // (inside kept on the right), then the loop is walked corner-to-corner
+    // from the region's topmost-leftmost pixel until it closes. Returns the
+    // outer contour only — interior holes are separate loops, never visited.
+    traceMaskOutline(isInside, minX, minY, maxX, maxY, w, h, startX, startY) {
+        const inside = (x, y) => x >= 0 && x < w && y >= 0 && y < h && isInside(x, y);
+        const key = (x, y) => y * (w + 2) + x;
+        const nextEdge = new Map();
+        const addEdge = (x1, y1, x2, y2) => {
+            const k = key(x1, y1);
+            const list = nextEdge.get(k);
+            if (list) list.push(x2, y2); else nextEdge.set(k, [x2, y2]);
+        };
+        let sx = startX, sy = startY;
+        for (let y = minY; y <= maxY; y++) {
+            for (let x = minX; x <= maxX; x++) {
+                if (!inside(x, y)) continue;
+                if (sx === undefined) { sx = x; sy = y; }
+                if (!inside(x, y - 1)) addEdge(x, y, x + 1, y);
+                if (!inside(x + 1, y)) addEdge(x + 1, y, x + 1, y + 1);
+                if (!inside(x, y + 1)) addEdge(x + 1, y + 1, x, y + 1);
+                if (!inside(x - 1, y)) addEdge(x, y + 1, x, y);
+            }
+        }
+        if (sx === undefined) return [];
+        const pts = [];
+        let cx = sx, cy = sy;
+        const limit = 4 * (maxX - minX + maxY - minY + 4) * 8;
+        do {
+            pts.push([cx, cy]);
+            const list = nextEdge.get(key(cx, cy));
+            if (!list || list.length === 0) break;
+            cy = list.pop();
+            cx = list.pop();
+        } while ((cx !== sx || cy !== sy) && pts.length < limit);
+        return pts;
+    }
+
+    // Douglas-Peucker with a cheap collinear collapse first — traced walls
+    // are long axis-aligned runs of unit steps, so most points drop out.
+    simplifyPath(points, epsilon) {
+        if (points.length < 3) return points;
+        const collapsed = [points[0]];
+        for (let i = 1; i < points.length - 1; i++) {
+            const [ax, ay] = collapsed[collapsed.length - 1];
+            const [bx, by] = points[i];
+            const [cx, cy] = points[i + 1];
+            if ((bx - ax) * (cy - ay) !== (cx - ax) * (by - ay)) collapsed.push(points[i]);
+        }
+        collapsed.push(points[points.length - 1]);
+
+        const keep = new Uint8Array(collapsed.length);
+        keep[0] = keep[collapsed.length - 1] = 1;
+        const stack = [[0, collapsed.length - 1]];
+        while (stack.length) {
+            const [a, b] = stack.pop();
+            const [ax, ay] = collapsed[a];
+            const [bx, by] = collapsed[b];
+            const dx = bx - ax, dy = by - ay;
+            const len = Math.hypot(dx, dy) || 1;
+            let worst = -1, worstDist = epsilon;
+            for (let i = a + 1; i < b; i++) {
+                const d = Math.abs(dx * (ay - collapsed[i][1]) - (ax - collapsed[i][0]) * dy) / len;
+                if (d > worstDist) { worstDist = d; worst = i; }
+            }
+            if (worst >= 0) {
+                keep[worst] = 1;
+                stack.push([a, worst], [worst, b]);
+            }
+        }
+        return collapsed.filter((_, i) => keep[i]);
+    }
+
+    // The traced outer wall, drawn as a locked outline and exported as the
+    // building footprint. Stored as canvas-pixel points on this.buildingOutline.
+    setBuildingOutline(points) {
+        if (this.buildingOutlineObject) this.canvas.remove(this.buildingOutlineObject);
+        this.buildingOutline = points;
+        const poly = new fabric.Polygon(points, {
+            fill: 'rgba(0, 0, 0, 0)',
+            stroke: '#212529',
+            strokeWidth: 3,
+            selectable: false,
+            evented: false,
+            objectCaching: false
+        });
+        this.buildingOutlineObject = poly;
+        this.canvas.add(poly);
+        this.canvas.sendObjectToBack(poly);
     }
 
     async uploadFloorplan() {
@@ -943,7 +1347,12 @@ class IMDFBuilder {
                 name: document.getElementById('buildingName').value || 'Building',
                 placeId: buildingPlaceId,
                 widthMeters: parseFloat(document.getElementById('buildingWidth').value) || null,
-                coordinates: this.getBuildingCoordinates()
+                coordinates: this.getBuildingCoordinates(),
+                // Traced outer wall (canvas px / 100000, one ring) — the server
+                // uses it as the real footprint/level outline when present.
+                outline: this.buildingOutline
+                    ? [this.buildingOutline.map(p => [p.x / 100000, p.y / 100000])]
+                    : null
             },
             levels: this.levels.map(l => ({
                 id: l.id,
@@ -971,13 +1380,25 @@ class IMDFBuilder {
                 levelId: a.levelId,
                 coordinates: this.getPointCoordinates(a.fabricObject)
             })),
-            fixtures: this.fixtures.map(f => ({
-                id: f.id,
-                category: f.category,
-                levelId: f.levelId,
-                geometryType: 'LineString',
-                coordinates: this.getLineCoordinates(f.fabricObject)
-            })),
+            fixtures: this.fixtures.map(f => {
+                const isLine = f.fabricObject && f.fabricObject.type === 'line';
+                return {
+                    id: f.id,
+                    name: f.name || null,
+                    category: f.category,
+                    placeId: f.placeId || null,
+                    levelId: f.levelId,
+                    // Places' desk icon can be oriented via the documented
+                    // "rotation" fixture extension — taken from the shape's
+                    // rotation handle.
+                    rotation: !isLine && f.fabricObject && Math.round(f.fabricObject.angle || 0) !== 0
+                        ? Math.round(f.fabricObject.angle) : null,
+                    geometryType: isLine ? 'LineString' : 'Polygon',
+                    coordinates: isLine
+                        ? this.getLineCoordinates(f.fabricObject)
+                        : this.getObjectCoordinates(f.fabricObject)
+                };
+            }),
             openings: this.openings.map(o => ({
                 id: o.id,
                 category: o.category,
@@ -1097,15 +1518,23 @@ class IMDFBuilder {
             if (data.units) {
                 data.units.forEach(unitData => {
                     const isSection = unitData.featureType === 'section';
-                    const rect = this.rectFromSavedCoordinates(unitData.coordinates, {
+                    const shape = this.shapeFromSavedCoordinates(unitData.coordinates, {
                         fill: isSection ? 'rgba(255, 140, 0, 0.3)' : 'rgba(0, 120, 212, 0.3)',
                         stroke: isSection ? '#ff8c00' : '#0078d4'
                     });
-                    unitData.fabricObject = rect;
-                    rect.imdfData = unitData;
+                    unitData.fabricObject = shape;
+                    shape.imdfData = unitData;
                     this.units.push(unitData);
-                    this.canvas.add(rect);
+                    this.canvas.add(shape);
                 });
+            }
+
+            // Restore the traced building outline
+            this.buildingOutlineObject = null;
+            this.buildingOutline = null;
+            const outlineRing = data.building && data.building.outline && data.building.outline[0];
+            if (Array.isArray(outlineRing) && outlineRing.length >= 3) {
+                this.setBuildingOutline(outlineRing.map(p => ({ x: p[0] * 100000, y: p[1] * 100000 })));
             }
 
             // Load amenities
@@ -1131,11 +1560,15 @@ class IMDFBuilder {
             // silently deleted them from the project on the next save.
             if (data.fixtures) {
                 data.fixtures.forEach(fixtureData => {
-                    const line = this.lineFromSavedCoordinates(fixtureData.coordinates, { stroke: '#6c757d', strokeWidth: 3 });
-                    fixtureData.fabricObject = line;
-                    line.imdfData = fixtureData;
+                    const shape = fixtureData.geometryType === 'Polygon'
+                        ? this.shapeFromSavedCoordinates(fixtureData.coordinates, {
+                            fill: 'rgba(108, 117, 125, 0.35)', stroke: '#6c757d', strokeWidth: 1
+                        })
+                        : this.lineFromSavedCoordinates(fixtureData.coordinates, { stroke: '#6c757d', strokeWidth: 3 });
+                    fixtureData.fabricObject = shape;
+                    shape.imdfData = fixtureData;
                     this.fixtures.push(fixtureData);
-                    this.canvas.add(line);
+                    this.canvas.add(shape);
                 });
             }
             if (data.openings) {
@@ -1169,6 +1602,8 @@ class IMDFBuilder {
             this.floorplanImage = null;
             this.buildingId = null;
             this.footprintId = null;
+            this.buildingOutline = null;
+            this.buildingOutlineObject = null;
 
             document.getElementById('projectName').value = '';
             document.getElementById('buildingName').value = '';
@@ -1244,6 +1679,23 @@ class IMDFBuilder {
         return new fabric.Rect({ left, top, width, height, strokeWidth: 2, ...options });
     }
 
+    // Axis-aligned 4-corner rings come back as rectangles (easy to edit);
+    // anything else — traced corridors, L-shaped rooms — as a polygon.
+    shapeFromSavedCoordinates(coordinates, options) {
+        const ring = Array.isArray(coordinates) && coordinates[0];
+        if (ring && ring.length > 3) {
+            const xs = new Set(ring.map(p => p[0]));
+            const ys = new Set(ring.map(p => p[1]));
+            const isBox = ring.length <= 5 && xs.size <= 2 && ys.size <= 2;
+            if (!isBox) {
+                const points = ring.slice(0, ring.length - 1)
+                    .map(p => ({ x: p[0] * 100000, y: p[1] * 100000 }));
+                return new fabric.Polygon(points, { strokeWidth: 2, objectCaching: false, ...options });
+            }
+        }
+        return this.rectFromSavedCoordinates(coordinates, options);
+    }
+
     lineFromSavedCoordinates(coordinates, options) {
         const pts = Array.isArray(coordinates) && coordinates.length >= 2
             ? coordinates
@@ -1295,12 +1747,26 @@ class IMDFBuilder {
     getObjectCoordinates(obj) {
         // Convert fabric object to polygon coordinates
         if (!obj) return [[[0, 0], [0, 0.0001], [0.0001, 0.0001], [0.0001, 0], [0, 0]]];
-        
+
+        if (obj.type === 'polygon') {
+            const m = obj.calcTransformMatrix();
+            const ring = obj.points.map(p => {
+                const x = p.x - obj.pathOffset.x;
+                const y = p.y - obj.pathOffset.y;
+                return [
+                    (m[0] * x + m[2] * y + m[4]) / 100000,
+                    (m[1] * x + m[3] * y + m[5]) / 100000
+                ];
+            });
+            ring.push([ring[0][0], ring[0][1]]);
+            return [ring];
+        }
+
         const left = obj.left / 100000;
         const top = obj.top / 100000;
         const width = (obj.width * obj.scaleX) / 100000;
         const height = (obj.height * obj.scaleY) / 100000;
-        
+
         return [[
             [left, top],
             [left, top + height],
@@ -1312,7 +1778,23 @@ class IMDFBuilder {
 
     getDisplayPoint(obj) {
         if (!obj) return { type: 'Point', coordinates: [0, 0] };
-        
+
+        // For traced polygons (L-shapes, corridors) the bounding-box centre
+        // can fall outside the room — use the area centroid instead.
+        if (obj.type === 'polygon') {
+            const ring = this.getObjectCoordinates(obj)[0];
+            let area = 0, cx = 0, cy = 0;
+            for (let i = 0; i < ring.length - 1; i++) {
+                const cross = ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1];
+                area += cross;
+                cx += (ring[i][0] + ring[i + 1][0]) * cross;
+                cy += (ring[i][1] + ring[i + 1][1]) * cross;
+            }
+            if (Math.abs(area) > 1e-12) {
+                return { type: 'Point', coordinates: [cx / (3 * area), cy / (3 * area)] };
+            }
+        }
+
         return {
             type: 'Point',
             coordinates: [
