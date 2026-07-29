@@ -659,72 +659,96 @@ class IMDFBuilder {
         const el = bg.getElement ? bg.getElement() : bg._element;
         const iw = el.naturalWidth || el.width;
         const ih = el.naturalHeight || el.height;
-        const maxDim = 900;
-        const s = Math.min(1, maxDim / Math.max(iw, ih));
-        const w = Math.max(1, Math.round(iw * s));
-        const h = Math.max(1, Math.round(ih * s));
+        const maxDim = 1200;
 
-        const off = document.createElement('canvas');
-        off.width = w;
-        off.height = h;
-        const ctx = off.getContext('2d', { willReadFrequently: true });
-        ctx.drawImage(el, 0, 0, w, h);
-        const px = ctx.getImageData(0, 0, w, h).data;
-
+        // Binarize the plan at a given scale and label its ink blobs. The
+        // largest blob is the outer wall — its bounding box bounds the
+        // building, so dashed construction marks, title text and dimension
+        // lines outside it get filtered away.
         // 1 = open space (light or transparent), 0 = ink (walls, lines).
         // Thin lines are kept on purpose: door swing arcs are thin, and they
         // are what seals a doorway once the ink is dilated below.
         // `mark` additionally captures faint strokes — CAD plans draw
         // furniture in light gray, well above the wall-ink threshold — and
         // feeds only the furniture detector, never room detection.
-        let open = new Uint8Array(w * h);
-        const mark = new Uint8Array(w * h);
-        for (let i = 0; i < w * h; i++) {
-            const lum = px[i * 4 + 3] < 40
-                ? 255
-                : 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
-            open[i] = lum > 180 ? 1 : 0;
-            mark[i] = lum <= 245 ? 1 : 0;
+        const analyze = (scale) => {
+            const aw = Math.max(1, Math.round(iw * scale));
+            const ah = Math.max(1, Math.round(ih * scale));
+            const off = document.createElement('canvas');
+            off.width = aw;
+            off.height = ah;
+            const ctx = off.getContext('2d', { willReadFrequently: true });
+            ctx.drawImage(el, 0, 0, aw, ah);
+            const px = ctx.getImageData(0, 0, aw, ah).data;
+
+            const open = new Uint8Array(aw * ah);
+            const mark = new Uint8Array(aw * ah);
+            for (let i = 0; i < aw * ah; i++) {
+                const lum = px[i * 4 + 3] < 40
+                    ? 255
+                    : 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
+                open[i] = lum > 180 ? 1 : 0;
+                mark[i] = lum <= 245 ? 1 : 0;
+            }
+
+            const inkComp = new Int32Array(aw * ah);
+            const inkStack = [];
+            let bounds = null;
+            let nextId = 1;
+            for (let start = 0; start < aw * ah; start++) {
+                if (open[start] || inkComp[start]) continue;
+                const c = { id: nextId++, minX: aw, minY: ah, maxX: 0, maxY: 0, count: 0 };
+                inkStack.push(start);
+                while (inkStack.length) {
+                    const i = inkStack.pop();
+                    if (i < 0 || i >= aw * ah || inkComp[i] || open[i]) continue;
+                    inkComp[i] = c.id;
+                    c.count++;
+                    const x = i % aw, y = (i / aw) | 0;
+                    if (x < c.minX) c.minX = x;
+                    if (x > c.maxX) c.maxX = x;
+                    if (y < c.minY) c.minY = y;
+                    if (y > c.maxY) c.maxY = y;
+                    if (x > 0) inkStack.push(i - 1);
+                    if (x < aw - 1) inkStack.push(i + 1);
+                    inkStack.push(i - aw, i + aw);
+                }
+                if (!bounds || c.count > bounds.count) bounds = c;
+            }
+            return { w: aw, h: ah, open, mark, inkComp, bounds };
+        };
+
+        // First pass scans the whole page; if the plan sits inside wide page
+        // margins (a PDF sheet, a title block), rescan at a scale where the
+        // building itself gets ~1000px, so small offices keep enough pixels
+        // to detect regardless of how much white space surrounds the plan.
+        let s = Math.min(1, maxDim / Math.max(iw, ih));
+        let A = analyze(s);
+        if (A.bounds) {
+            const buildingMaxImg = Math.max(
+                A.bounds.maxX - A.bounds.minX,
+                A.bounds.maxY - A.bounds.minY) / s;
+            const s2 = Math.min(1, 1000 / Math.max(buildingMaxImg, 1));
+            if (s2 > s * 1.15 && iw * s2 * ih * s2 < 4.2e6) {
+                s = s2;
+                A = analyze(s);
+            }
         }
+        const { w, h, mark, inkComp, bounds } = A;
+        let open = A.open;
 
         // Untouched copy of the binarized image: room regrowth (below) must
         // stop at real wall pixels, and furniture detection reads real ink.
         const openOrig = new Uint8Array(open);
 
-        // Label every connected ink blob. The largest is the outer wall — its
-        // bounding box bounds the building, so dashed construction marks,
-        // title text and dimension lines outside it get filtered away. The
-        // small free-standing blobs inside are furniture candidates.
-        const inkComp = new Int32Array(w * h);
-        const comps = [];
-        const inkStack = [];
-        let bounds = null;
-        for (let start = 0; start < w * h; start++) {
-            if (open[start] || inkComp[start]) continue;
-            const id = comps.length + 1;
-            const c = { id, minX: w, minY: h, maxX: 0, maxY: 0, count: 0 };
-            inkStack.push(start);
-            while (inkStack.length) {
-                const i = inkStack.pop();
-                if (i < 0 || i >= w * h || inkComp[i] || open[i]) continue;
-                inkComp[i] = id;
-                c.count++;
-                const x = i % w, y = (i / w) | 0;
-                if (x < c.minX) c.minX = x;
-                if (x > c.maxX) c.maxX = x;
-                if (y < c.minY) c.minY = y;
-                if (y > c.maxY) c.maxY = y;
-                if (x > 0) inkStack.push(i - 1);
-                if (x < w - 1) inkStack.push(i + 1);
-                inkStack.push(i - w, i + w);
-            }
-            comps.push(c);
-            if (!bounds || c.count > bounds.count) bounds = c;
-        }
-
         // Dilate the ink to seal door openings (door leaf + swing arc close
         // the gap once thickened). Boxes are grown back by the same amount.
-        const sealRadius = Math.max(2, Math.round(Math.max(w, h) / 300));
+        // Sized against the building, not the image — a plan exported with
+        // wide page margins must seal identically to a tight crop.
+        const bMax = bounds
+            ? Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY)
+            : Math.max(w, h);
+        const sealRadius = Math.max(2, Math.round(bMax / 250));
         for (let pass = 0; pass < sealRadius; pass++) {
             const eroded = new Uint8Array(open);
             for (let y = 0; y < h; y++) {
@@ -835,12 +859,18 @@ class IMDFBuilder {
         let added = 0;
         let polygons = 0;
         const acceptedRegions = [];
+        // Room size limits are fractions of the building's bounding box, not
+        // of the image — page margins around the plan must not change what
+        // counts as a room.
+        const bboxArea = bounds
+            ? (bounds.maxX - bounds.minX + 1) * (bounds.maxY - bounds.minY + 1)
+            : imgArea;
         for (const r of regions.sort((a, b) => b.count - a.count)) {
-            if (added >= 80) break;
+            if (added >= 150) break;
             const bw = r.maxX - r.minX + 1;
             const bh = r.maxY - r.minY + 1;
-            const areaFraction = r.count / imgArea;
-            if (areaFraction < 0.0015 || areaFraction > 0.35) continue; // noise / whole floor
+            const buildingFraction = r.count / bboxArea;
+            if (buildingFraction < 0.0024 || buildingFraction > 0.6) continue; // noise / whole floor
             if (bw < 6 || bh < 6) continue;
             if (bounds && (r.minX < bounds.minX - tol || r.maxX > bounds.maxX + tol ||
                            r.minY < bounds.minY - tol || r.maxY > bounds.maxY + tol)) continue;
