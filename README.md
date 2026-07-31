@@ -22,13 +22,14 @@ This is a fork of [loryanstrant/IMDF-Builder-for-Places](https://github.com/lory
 ## Features
 
 - 🖼️ **Floor Plan Upload**: Upload PDF or image files of your floor plans
-- 🪄 **Auto-Trace Rooms**: Automatically detect rooms, the building outline, walls, and furniture from the floor plan — all editable afterwards
+- 🪄 **Auto-Trace Rooms**: Automatically detect rooms, walkways, the building outline, cubicle banks, and furniture from the floor plan — the whole floor is partitioned into units, furniture is decomposed into clean table/chair/desk rectangles, and everything stays editable afterwards
 - 🏢 **Interactive Editor**: Visual canvas-based editor for placing indoor mapping elements
+- 🎨 **Category Colours**: every unit previews in a Places-like tint (walkway, workspace, conference room, kitchen, non-public, …) so the canvas approximates the imported map
 - 📍 **IMDF Elements Support**:
-  - Units (rooms, offices, conference rooms)
+  - Units (rooms, offices, conference rooms, walkways and other spaces)
   - Sections (desk pools for bookable desks)
   - Amenities (desks, seating, facilities)
-  - Fixtures (walls, windows)
+  - Fixtures (furniture and bookable desks with rotation)
   - Openings (doors, entrances)
   - Levels (floors)
 - 📐 **Real-World Scaling**: Exports scaled to the building's physical width; pixel metrics and exact geometry entry for precise shapes
@@ -144,7 +145,9 @@ docker run -d -p 3009:3009 -v $(pwd)/projects:/app/projects -v $(pwd)/uploads:/a
 
 ### Step 4: Place Items on the Floor Plan
 
-The fastest way to start is **Auto-Trace Rooms**: it detects rooms (wall-following shapes), the building outline, and free-standing furniture on the uploaded floor plan. Every detected shape can be moved, resized, renamed, or deleted afterwards.
+The fastest way to start is **Auto-Trace Rooms**: it detects rooms (wall-following shapes), the building outline, walkway units covering the leftover circulation space (so the whole floor renders like a professionally built Places map, walls showing as the gaps between units), free-standing cubicle banks (traced with their cells kept open), and furniture decomposed into clean table/chair/desk rectangles. Every detected shape can be moved, resized, renamed, or deleted afterwards.
+
+After tracing, set each room's category (restroom, conference room, kitchen, …) in its properties — Places tints rooms by category and draws icons for restrooms, elevators, and stairs.
 
 To place items manually (or adjust after auto-tracing):
 1. Select a tool from the "Place Items" section:
@@ -202,7 +205,11 @@ The import correlates each IMDF feature to an object in the Places directory
 4. For bookable desks: desks are located through their parent Section (desk
    pool). Draw a Section over the desk area and correlate it to that Section
    object's PlaceId — without it, reserving a desk reports it couldn't be
-   located on the map.
+   located on the map. To show an individual desk, select its furniture
+   shape, set the category to **Desk**, and paste the Desk object's PlaceId
+   into its Places ID field (naming the shape after the directory object is
+   recommended). Places then draws its own desk icon there and colours it by
+   live availability — green when free, red when reserved.
 5. Run the correlation and create the map:
    ```powershell
    Import-MapCorrelations -FilePath .\imdf-export.zip -CorrelationsFilePath .\mapfeatures.csv
