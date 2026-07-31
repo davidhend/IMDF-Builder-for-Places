@@ -258,6 +258,186 @@ function ensureCounterclockwise(ring) {
   return area > 0 ? ring.slice().reverse() : ring;
 }
 
+// Places' New-Map backend fails with an opaque internal error
+// ("DsApiRestClient/InvokeActionAsync throw exception") on polygons that have
+// interior rings (confirmed 2026-07-31 with a 3-ring walkway), so holed
+// shapes are split into simple polygons before export. Method: rasterize the
+// even-odd region onto a grid, cut it into column slabs at every hole's
+// x-extents — inside such a slab a hole always spans the full slab width, so
+// no piece can enclose one — then trace each piece's outline. The map renders
+// the same; the walkway just becomes several adjacent units.
+function splitHoledPolygon(rings) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const ring of rings) {
+    for (const [x, y] of ring) {
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+  }
+  const span = Math.max(maxX - minX, maxY - minY, 1e-12);
+  const scale = 1598 / span;
+  const gw = Math.max(3, Math.round((maxX - minX) * scale) + 2);
+  const gh = Math.max(3, Math.round((maxY - minY) * scale) + 2);
+  const gx = x => (x - minX) * scale + 1;
+  const gy = y => (y - minY) * scale + 1;
+  const backX = x => minX + (x - 1) / scale;
+  const backY = y => minY + (y - 1) / scale;
+
+  // Even-odd scanline fill across all rings at once.
+  const edges = [];
+  for (const ring of rings) {
+    for (let i = 0; i < ring.length - 1; i++) {
+      const x1 = gx(ring[i][0]), y1 = gy(ring[i][1]);
+      const x2 = gx(ring[i + 1][0]), y2 = gy(ring[i + 1][1]);
+      if (y1 !== y2) edges.push([x1, y1, x2, y2]);
+    }
+  }
+  const mask = new Uint8Array(gw * gh);
+  for (let row = 0; row < gh; row++) {
+    const yc = row + 0.5;
+    const xs = [];
+    for (const [x1, y1, x2, y2] of edges) {
+      if ((y1 <= yc && y2 > yc) || (y2 <= yc && y1 > yc)) {
+        xs.push(x1 + (yc - y1) * (x2 - x1) / (y2 - y1));
+      }
+    }
+    xs.sort((a, b) => a - b);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const a = Math.max(0, Math.ceil(xs[k] - 0.5));
+      const b = Math.min(gw - 1, Math.floor(xs[k + 1] - 0.5));
+      for (let x = a; x <= b; x++) mask[row * gw + x] = 1;
+    }
+  }
+
+  // Column cuts at each hole's x-extents.
+  const cutSet = new Set([0, gw]);
+  for (let i = 1; i < rings.length; i++) {
+    let hMin = Infinity, hMax = -Infinity;
+    for (const [x] of rings[i]) {
+      const g = gx(x);
+      if (g < hMin) hMin = g;
+      if (g > hMax) hMax = g;
+    }
+    cutSet.add(Math.max(0, Math.min(gw, Math.floor(hMin))));
+    cutSet.add(Math.max(0, Math.min(gw, Math.ceil(hMax) + 1)));
+  }
+  const cuts = [...cutSet].sort((a, b) => a - b);
+
+  // Flood-label 4-connected pieces within each slab, trace each outline.
+  const label = new Int32Array(gw * gh);
+  const pieces = [];
+  const stack = [];
+  for (let c = 0; c + 1 < cuts.length; c++) {
+    const [sa, sb] = [cuts[c], cuts[c + 1]];
+    for (let start = 0; start < gw * gh; start++) {
+      const sx = start % gw;
+      if (sx < sa || sx >= sb || !mask[start] || label[start]) continue;
+      const id = pieces.length + 1;
+      const piece = { id, minX: gw, minY: gh, maxX: 0, maxY: 0, count: 0 };
+      stack.push(start);
+      while (stack.length) {
+        const i = stack.pop();
+        const x = i % gw;
+        if (i < 0 || i >= gw * gh || x < sa || x >= sb || label[i] || !mask[i]) continue;
+        label[i] = id;
+        piece.count++;
+        const y = (i / gw) | 0;
+        if (x < piece.minX) piece.minX = x;
+        if (x > piece.maxX) piece.maxX = x;
+        if (y < piece.minY) piece.minY = y;
+        if (y > piece.maxY) piece.maxY = y;
+        if (x > 0) stack.push(i - 1);
+        if (x < gw - 1) stack.push(i + 1);
+        stack.push(i - gw, i + gw);
+      }
+      pieces.push(piece);
+    }
+  }
+
+  const result = [];
+  for (const piece of pieces) {
+    if (piece.count < 12) continue; // rasterization slivers
+    const outline = traceGridOutline(
+      (x, y) => x >= 0 && x < gw && y >= 0 && y < gh && label[y * gw + x] === piece.id,
+      piece.minX, piece.minY, piece.maxX, piece.maxY);
+    if (outline.length < 4) continue;
+    const ring = simplifyRing(outline, 1.2).map(([x, y]) => [backX(x), backY(y)]);
+    if (ring.length < 3) continue;
+    ring.push([ring[0][0], ring[0][1]]);
+    result.push(ring);
+  }
+  return result.length ? result : [rings[0]];
+}
+
+// Marching-squares outer contour of a grid mask (port of the client tracer).
+function traceGridOutline(isInside, minX, minY, maxX, maxY) {
+  const key = (x, y) => y * (maxX + 3) + x;
+  const nextEdge = new Map();
+  const addEdge = (x1, y1, x2, y2) => {
+    const k = key(x1, y1);
+    const list = nextEdge.get(k);
+    if (list) list.push(x2, y2); else nextEdge.set(k, [x2, y2]);
+  };
+  let sx, sy;
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      if (!isInside(x, y)) continue;
+      if (sx === undefined) { sx = x; sy = y; }
+      if (!isInside(x, y - 1)) addEdge(x, y, x + 1, y);
+      if (!isInside(x + 1, y)) addEdge(x + 1, y, x + 1, y + 1);
+      if (!isInside(x, y + 1)) addEdge(x + 1, y + 1, x, y + 1);
+      if (!isInside(x - 1, y)) addEdge(x, y + 1, x, y);
+    }
+  }
+  if (sx === undefined) return [];
+  const pts = [];
+  let cx = sx, cy = sy;
+  const limit = 8 * (maxX - minX + maxY - minY + 4) * 8;
+  do {
+    pts.push([cx, cy]);
+    const list = nextEdge.get(key(cx, cy));
+    if (!list || list.length === 0) break;
+    cy = list.pop();
+    cx = list.pop();
+  } while ((cx !== sx || cy !== sy) && pts.length < limit);
+  return pts;
+}
+
+// Douglas-Peucker with collinear collapse (port of the client simplifier).
+function simplifyRing(points, epsilon) {
+  if (points.length < 3) return points;
+  const collapsed = [points[0]];
+  for (let i = 1; i < points.length - 1; i++) {
+    const [ax, ay] = collapsed[collapsed.length - 1];
+    const [bx, by] = points[i];
+    const [cx, cy] = points[i + 1];
+    if ((bx - ax) * (cy - ay) !== (cx - ax) * (by - ay)) collapsed.push(points[i]);
+  }
+  collapsed.push(points[points.length - 1]);
+  const keep = new Uint8Array(collapsed.length);
+  keep[0] = keep[collapsed.length - 1] = 1;
+  const stack = [[0, collapsed.length - 1]];
+  while (stack.length) {
+    const [a, b] = stack.pop();
+    const [ax, ay] = collapsed[a];
+    const [bx, by] = collapsed[b];
+    const dx = bx - ax, dy = by - ay;
+    const len = Math.hypot(dx, dy) || 1;
+    let worst = -1, worstDist = epsilon;
+    for (let i = a + 1; i < b; i++) {
+      const d = Math.abs(dx * (ay - collapsed[i][1]) - (ax - collapsed[i][0]) * dy) / len;
+      if (d > worstDist) { worstDist = d; worst = i; }
+    }
+    if (worst >= 0) {
+      keep[worst] = 1;
+      stack.push([a, worst], [worst, b]);
+    }
+  }
+  return collapsed.filter((_, i) => keep[i]);
+}
+
 // Helper function to generate IMDF files
 function generateIMDFFiles(projectData) {
   const {
@@ -275,7 +455,39 @@ function generateIMDFFiles(projectData) {
   // 'section' and export to their own file — Places locates bookable desks
   // through their parent Section correlated to a section feature.
   const sections = units.filter(u => u.featureType === 'section');
-  const roomUnits = units.filter(u => u.featureType !== 'section');
+
+  // Units with interior rings (auto-traced walkways wrapped around room
+  // blocks) are split into simple polygons — New-Map fails on holes. Piece
+  // ids derive deterministically from the parent id so re-exports keep the
+  // same FeatureIds in mapfeatures.csv.
+  const pieceId = (id, i) => {
+    const base = String(id || randomUUID());
+    return i === 0 ? base : base.slice(0, -3) + i.toString(16).padStart(3, '0');
+  };
+  const canvasRingCentroid = ring => {
+    const [ox, oy] = ring[0];
+    let area = 0, cx = 0, cy = 0;
+    for (let i = 0; i < ring.length - 1; i++) {
+      const x1 = ring[i][0] - ox, y1 = ring[i][1] - oy;
+      const x2 = ring[i + 1][0] - ox, y2 = ring[i + 1][1] - oy;
+      const cross = x1 * y2 - x2 * y1;
+      area += cross;
+      cx += (x1 + x2) * cross;
+      cy += (y1 + y2) * cross;
+    }
+    return Math.abs(area) > 1e-18 ? [ox + cx / (3 * area), oy + cy / (3 * area)] : ring[0];
+  };
+  const expandHoles = unit => {
+    const rings = unit.coordinates || [];
+    if (rings.length <= 1) return [unit];
+    return splitHoledPolygon(rings).map((ring, i) => ({
+      ...unit,
+      id: pieceId(unit.id, i),
+      coordinates: [ring],
+      display_point: { type: 'Point', coordinates: canvasRingCentroid(ring) }
+    }));
+  };
+  const roomUnits = units.filter(u => u.featureType !== 'section').flatMap(expandHoles);
 
   // The canvas produces tiny coordinates near [0, 0] (pixels / 100000, in
   // degrees). Microsoft Places requires georeferenced geometry, so shift the
@@ -527,22 +739,29 @@ function generateIMDFFiles(projectData) {
     }
     return Math.abs(area) > 1e-18 ? [ox + cx / (3 * area), oy + cy / (3 * area)] : ring[0];
   };
-  const furnitureUnitFeatures = furnitureFixtures.map(f => {
-    const rings = fixturePolygon(f);
-    return {
-      type: 'Feature',
-      id: f.id || randomUUID(),
-      feature_type: 'unit',
-      geometry: { type: 'Polygon', coordinates: rings },
-      properties: {
-        category: 'unspecified',
-        restriction: null,
-        name: toLabels(f.name || 'Furniture'),
-        alt_name: null,
-        display_point: { type: 'Point', coordinates: ringCentroid(rings[0]) },
-        level_id: f.levelId || null
-      }
-    };
+  // Hole-split furniture polygons too (cubicle banks trace with open cells).
+  const furnitureUnitFeatures = furnitureFixtures.flatMap(f => {
+    const holed = f.geometryType === 'Polygon' && Array.isArray(f.coordinates?.[0]) && f.coordinates.length > 1;
+    const variants = holed
+      ? splitHoledPolygon(f.coordinates).map((ring, i) => ({ ...f, id: pieceId(f.id, i), coordinates: [ring] }))
+      : [f];
+    return variants.map(v => {
+      const rings = fixturePolygon(v);
+      return {
+        type: 'Feature',
+        id: v.id || randomUUID(),
+        feature_type: 'unit',
+        geometry: { type: 'Polygon', coordinates: rings },
+        properties: {
+          category: 'unspecified',
+          restriction: null,
+          name: toLabels(v.name || 'Furniture'),
+          alt_name: null,
+          display_point: { type: 'Point', coordinates: ringCentroid(rings[0]) },
+          level_id: v.levelId || null
+        }
+      };
+    });
   });
 
   unitFeatures.features.push(...furnitureUnitFeatures);
@@ -650,6 +869,11 @@ function validatePlacesCompatibility(files) {
       }
       if (type === 'unit' && !feature.properties.level_id) {
         problems.push(`${label}: unit requires level_id (assign the unit to a level)`);
+      }
+      // New-Map fails with an opaque internal error on interior rings; the
+      // exporter splits holed polygons, so any survivor here is a bug.
+      if (feature.geometry && feature.geometry.type === 'Polygon' && feature.geometry.coordinates.length > 1) {
+        problems.push(`${label}: polygon has interior rings (holes) — Places' importer rejects these`);
       }
     }
   }

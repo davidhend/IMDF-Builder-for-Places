@@ -2,18 +2,39 @@
 
 A user-friendly web application to create Indoor Mapping Data Format (IMDF) files for use with Microsoft Places. This tool provides a graphical interface for non-technical users to upload floor plans, place various indoor mapping elements, and generate standards-compliant IMDF files.
 
+## About this fork
+
+This is a fork of [loryanstrant/IMDF-Builder-for-Places](https://github.com/loryanstrant/IMDF-Builder-for-Places) with changes focused on getting exports to actually import and render in Microsoft Places, validated end-to-end against a real tenant:
+
+- **Places-compatible export**: packages match the undocumented subset of IMDF that `Import-MapCorrelations` / `New-Map` accept (localized name dicts, null building geometry, exact property names, allowlisted files only). The exporter validates every package before download and reports real problems clearly instead of Places' misleading errors.
+- **Streamlined import workflow**: enter PlaceIds in the UI (with paste/typo validation) and the export includes a pre-correlated `mapfeatures.csv`, so the `Import-MapCorrelations` extract pass isn't needed.
+- **Auto-Trace Rooms**: detects rooms, the building outline, walls, and free-standing furniture from the uploaded floor plan using geometric wall detection. Seals door openings so real CAD plans trace cleanly, works at any page margin/scale, and every detected shape stays editable.
+- **Full-floor partition**: auto-trace also covers the leftover circulation space with `walkway` units — corridors, lobbies, open areas — so the whole floor renders like professionally built Places maps, with walls appearing as the gaps between units. Walkways that wrap around room blocks are split into simple polygons at export (Places' importer fails on polygons with holes).
+- **Recognisable furniture**: furniture clusters are decomposed into clean rectangles — a conference table with its chairs exports as one table and individual chairs instead of a single traced blob — and free-standing cubicle banks are traced with their cells kept open so cubicle outlines show on the map.
+- **Bookable desk support**: sections (desk pools) with visible outlines, and furniture exported so it actually renders in Places, including auto-drawn desk icons with rotation.
+- **Real-world scaling**: exports are scaled to the building's physical width, with pixel metrics and exact geometry entry for precise shapes.
+- **Categories aligned with Places**: the workplace set (`conferenceroom`, `workspace`, `desk`) plus space categories (`walkway`, `lobby`, `lounge`, `kitchen`, `foodservice`, `phoneroom`, `mothersroom`, `nonpublic`, `storage`, …), with a Places-style colour preview in the editor so the canvas approximates how the imported map will look.
+- **Editor improvements**: Alt+click cycles through overlapping shapes, and shape positions are restored correctly when loading a saved project.
+- **Fixes**: startup crash (#9), floor plans not rendering (#4), and a multer security bump (CVE-2026-5038, CVE-2026-5079).
+
+> **Note:** the pre-built `ghcr.io/loryanstrant/imdf-builder-for-places` Docker image is built from the upstream repository and does **not** include these changes. To run this fork, use the local install instructions or build the Docker image locally (`build: .` in `docker-compose.yml`).
+
 ## Features
 
 - 🖼️ **Floor Plan Upload**: Upload PDF or image files of your floor plans
+- 🪄 **Auto-Trace Rooms**: Automatically detect rooms, walkways, the building outline, cubicle banks, and furniture from the floor plan — the whole floor is partitioned into units, furniture is decomposed into clean table/chair/desk rectangles, and everything stays editable afterwards
 - 🏢 **Interactive Editor**: Visual canvas-based editor for placing indoor mapping elements
+- 🎨 **Category Colours**: every unit previews in a Places-like tint (walkway, workspace, conference room, kitchen, non-public, …) so the canvas approximates the imported map
 - 📍 **IMDF Elements Support**:
-  - Units (rooms, offices, conference rooms)
+  - Units (rooms, offices, conference rooms, walkways and other spaces)
+  - Sections (desk pools for bookable desks)
   - Amenities (desks, seating, facilities)
-  - Fixtures (walls, windows)
+  - Fixtures (furniture and bookable desks with rotation)
   - Openings (doors, entrances)
   - Levels (floors)
+- 📐 **Real-World Scaling**: Exports scaled to the building's physical width; pixel metrics and exact geometry entry for precise shapes
 - 💾 **Project Management**: Save and load projects for later editing
-- 📦 **Export**: Generate complete IMDF file packages as ZIP archives
+- 📦 **Export**: Generate complete, Places-validated IMDF packages plus a pre-correlated `mapfeatures.csv`
 - 🌓 **Dark Mode**: Toggle in the header; remembers your choice and follows your OS preference
 - 🐳 **Docker Support**: Easy deployment with Docker and Docker Compose
 
@@ -108,7 +129,7 @@ docker run -d -p 3000:3000 -v $(pwd)/projects:/app/projects -v $(pwd)/uploads:/a
 
 ### Step 1: Create a New Project
 1. Enter a project name in the "Project Name" field
-2. Enter your building name and venue coordinates (latitude, longitude)
+2. Enter your building name, venue coordinates (latitude, longitude), and the building's width in meters — this scales the export to real-world size
 3. Click "Save Project" to save your initial setup
 
 ### Step 2: Upload Floor Plan
@@ -123,6 +144,12 @@ docker run -d -p 3000:3000 -v $(pwd)/projects:/app/projects -v $(pwd)/uploads:/a
 4. Click on a level in the list to make it active for placing items
 
 ### Step 4: Place Items on the Floor Plan
+
+The fastest way to start is **Auto-Trace Rooms**: it detects rooms (wall-following shapes), the building outline, walkway units covering the leftover circulation space (so the whole floor renders like a professionally built Places map, walls showing as the gaps between units), free-standing cubicle banks (traced with their cells kept open), and furniture decomposed into clean table/chair/desk rectangles. Every detected shape can be moved, resized, renamed, or deleted afterwards.
+
+After tracing, set each room's category (restroom, conference room, kitchen, …) in its properties — Places tints rooms by category and draws icons for restrooms, elevators, and stairs.
+
+To place items manually (or adjust after auto-tracing):
 1. Select a tool from the "Place Items" section:
    - **Place Unit**: For rooms, offices, conference rooms
    - **Place Section**: For desk pools — the area a group of bookable desks sits in
@@ -130,7 +157,8 @@ docker run -d -p 3000:3000 -v $(pwd)/projects:/app/projects -v $(pwd)/uploads:/a
    - **Place Fixture**: For walls, windows
    - **Place Opening**: For doors, entrances
 2. Click on the canvas where you want to place the item
-3. Use "Select Mode" to select and move items
+3. Use "Select Mode" to select and move items — **Alt+click** cycles through overlapping shapes under the cursor
+4. Use the pixel metrics in the properties panel to enter exact position and size for a shape
 
 ### Step 5: Edit Item Properties
 1. Click "Select Mode" button
@@ -145,8 +173,9 @@ docker run -d -p 3000:3000 -v $(pwd)/projects:/app/projects -v $(pwd)/uploads:/a
 2. Two downloads are produced:
    - `imdf-export.zip` — the IMDF package Microsoft Places accepts:
      building.geojson, footprint.geojson, level.geojson, unit.geojson
-     (plus fixture.geojson when fixtures exist). Places rejects zips
-     containing any other files, so nothing else is included.
+     (plus section.geojson and fixture.geojson when sections or fixtures
+     exist). Places rejects zips containing any other files, so nothing
+     else is included.
    - `mapfeatures.csv` — a pre-filled correlations file for
      `Import-MapCorrelations` (see below)
 
@@ -176,7 +205,11 @@ The import correlates each IMDF feature to an object in the Places directory
 4. For bookable desks: desks are located through their parent Section (desk
    pool). Draw a Section over the desk area and correlate it to that Section
    object's PlaceId — without it, reserving a desk reports it couldn't be
-   located on the map.
+   located on the map. To show an individual desk, select its furniture
+   shape, set the category to **Desk**, and paste the Desk object's PlaceId
+   into its Places ID field (naming the shape after the directory object is
+   recommended). Places then draws its own desk icon there and colours it by
+   live availability — green when free, red when reserved.
 5. Run the correlation and create the map:
    ```powershell
    Import-MapCorrelations -FilePath .\imdf-export.zip -CorrelationsFilePath .\mapfeatures.csv

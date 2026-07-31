@@ -6,9 +6,9 @@ projects/
 .env
 
 # Local Places import working files
-imdf-export*.zip
-imdf_correlated*.zip
+*.zip
 imdf_correlated*/
 mapfeatures.csv
+*-mapfeatures.csv
 imdf-export/
 /*.png
