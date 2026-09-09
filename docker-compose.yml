@@ -2,9 +2,10 @@ version: '3.8'
 
 services:
   imdf-builder:
-    image: ghcr.io/loryanstrant/imdf-builder-for-places:latest
-    # Uncomment the line below and comment the image line above to build locally instead
-    # build: .
+    # This fork must be built locally — the upstream image still listens on
+    # port 3000 and lacks this fork's changes.
+    # image: ghcr.io/loryanstrant/imdf-builder-for-places:latest
+    build: .
     ports:
       # Change HOST_PORT in .env (or your environment) to avoid conflicts on 3009.
       - "${HOST_PORT:-3009}:3009"
