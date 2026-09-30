@@ -2,12 +2,14 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs').promises;
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 // archiver v8+ is ESM-only (loaded via dynamic import) and replaced the
 // archiver('zip', opts) factory with exported classes like ZipArchive
 const zipArchivePromise = import('archiver').then((mod) => mod.ZipArchive);
 const rateLimit = require('express-rate-limit');
 const { version } = require('./package.json');
+// Geometry helpers shared with the browser (auto-trace uses the same file).
+const MapGeom = require('./public/js/mapgeom.js');
 
 const app = express();
 const PORT = process.env.PORT || 3009;
@@ -212,6 +214,15 @@ app.post('/api/generate-imdf', projectLimiter, async (req, res) => {
   }
 });
 
+// The same package as JSON, for the in-app "Preview as Places" view.
+app.post('/api/preview-imdf', projectLimiter, async (req, res) => {
+  try {
+    res.json({ files: generateIMDFFiles(req.body.projectData) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Generate the Microsoft Places correlations CSV (mapfeatures.csv) matching
 // the exported IMDF package, replacing Import-MapCorrelations' extract pass.
 app.post('/api/generate-mapfeatures', projectLimiter, async (req, res) => {
@@ -250,23 +261,37 @@ function getVenueOrigin(venue) {
 }
 
 // GeoJSON exterior rings should wind counterclockwise (right-hand rule).
+// Measured relative to the first vertex: on raw longitude/latitude values a
+// thin shape's area is lost to floating-point cancellation.
 function ensureCounterclockwise(ring) {
+  const [ox, oy] = ring[0];
   let area = 0;
   for (let i = 0; i < ring.length - 1; i++) {
-    area += (ring[i + 1][0] - ring[i][0]) * (ring[i + 1][1] + ring[i][1]);
+    area += (ring[i][0] - ox) * (ring[i + 1][1] - oy) - (ring[i + 1][0] - ox) * (ring[i][1] - oy);
   }
-  return area > 0 ? ring.slice().reverse() : ring;
+  return area < 0 ? ring.slice().reverse() : ring;
 }
 
 // Places' New-Map backend fails with an opaque internal error
 // ("DsApiRestClient/InvokeActionAsync throw exception") on polygons that have
 // interior rings (confirmed 2026-07-31 with a 3-ring walkway), so holed
-// shapes are split into simple polygons before export. Method: rasterize the
-// even-odd region onto a grid, cut it into column slabs at every hole's
-// x-extents — inside such a slab a hole always spans the full slab width, so
-// no piece can enclose one — then trace each piece's outline. The map renders
-// the same; the walkway just becomes several adjacent units.
+// shapes are split into simple polygons before export. Axis-aligned shapes
+// (what auto-trace produces) are split exactly, on the grid of their own
+// coordinates. Anything else is rasterized: the even-odd region goes onto a
+// grid, is cut into column slabs at every hole's x-extents — inside such a
+// slab a hole always spans the full slab width, so no piece can enclose one —
+// and each piece's outline is traced. The map renders the same; the walkway
+// just becomes several adjacent units.
 function splitHoledPolygon(rings) {
+  const open = rings.map(ring => {
+    const last = ring[ring.length - 1];
+    return (ring[0][0] === last[0] && ring[0][1] === last[1]) ? ring.slice(0, -1) : ring;
+  });
+  if (open.every(ring => MapGeom.isRectilinear(ring, 1e-10))) {
+    const pieces = MapGeom.splitRectilinearHoles(open);
+    if (pieces.length) return pieces.map(ring => [...ring, [ring[0][0], ring[0][1]]]);
+  }
+
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const ring of rings) {
     for (const [x, y] of ring) {
@@ -445,7 +470,9 @@ function generateIMDFFiles(projectData) {
     building,
     levels = [],
     units = [],
-    fixtures = []
+    fixtures = [],
+    openings = [],
+    options = {}
   } = projectData;
 
   const buildingId = building?.id || randomUUID();
@@ -487,7 +514,11 @@ function generateIMDFFiles(projectData) {
       display_point: { type: 'Point', coordinates: canvasRingCentroid(ring) }
     }));
   };
-  const roomUnits = units.filter(u => u.featureType !== 'section').flatMap(expandHoles);
+  // Places paints units in file order, so floors go first (circulation
+  // underneath the rooms) and everything drawn on them follows.
+  const floorRank = u => (u.category === 'walkway' ? 0 : 1);
+  const roomUnits = units.filter(u => u.featureType !== 'section').flatMap(expandHoles)
+    .map((u, i) => [u, i]).sort((p, q) => floorRank(p[0]) - floorRank(q[0]) || p[1] - q[1]).map(p => p[0]);
 
   // The canvas produces tiny coordinates near [0, 0] (pixels / 100000, in
   // degrees). Microsoft Places requires georeferenced geometry, so shift the
@@ -657,10 +688,46 @@ function generateIMDFFiles(projectData) {
     }
   });
 
-  // Sections render with no visible border in Microsoft Places, so each one
-  // also gets a coincident unit — the unit draws the outline, the section
-  // carries the desk-pool correlation. The twin's id is derived from the
-  // section id (last block inverted) so it stays stable across exports.
+  // Places paints a section as a solid fill on top of the units, with no
+  // border. A section that spans the whole floor would therefore blot out
+  // every room and desk beneath it, so by default a section is exported as
+  // a hollow frame: a narrow band along its outline (a simple polygon — the
+  // band is cut once, by a hair, so there is no interior ring for the
+  // importer to reject). It still carries the desk-pool correlation and its
+  // label sits at the original centre. A section can opt back into a solid
+  // fill; then a coincident unit supplies the missing border. The twin's id
+  // is derived from the section id (last block inverted) so it stays stable
+  // across exports.
+  const frameWidth = 0.15 / metersPerUnit;
+  const hollow = section => {
+    const ring = section.coordinates?.[0];
+    if (!Array.isArray(ring) || ring.length < 4) return null;
+    const outer = MapGeom.cleanRing(ring.slice(0, -1));
+    const inner = MapGeom.offsetPolygon(outer, -frameWidth);
+    if (outer.length < 3 || inner.length !== outer.length) return null;
+    const box = MapGeom.ringBounds(outer), innerBox = MapGeom.ringBounds(inner);
+    if (innerBox.maxX - innerBox.minX < frameWidth || innerBox.maxY - innerBox.minY < frameWidth ||
+        innerBox.minX < box.minX || innerBox.maxX > box.maxX) return null;      // too small to frame
+    const n = outer.length;
+    const ux = outer[1][0] - outer[0][0], uy = outer[1][1] - outer[0][1];
+    const len = Math.hypot(ux, uy) || 1;
+    const gap = Math.min(frameWidth * 0.3, 0.02 / metersPerUnit);
+    const along = [ux / len * gap, uy / len * gap];
+    const path = [[outer[0][0] + along[0], outer[0][1] + along[1]]];
+    for (let i = 1; i < n; i++) path.push(outer[i]);
+    path.push(outer[0], inner[0]);
+    for (let i = n - 1; i >= 1; i--) path.push(inner[i]);
+    path.push([inner[0][0] + along[0], inner[0][1] + along[1]]);
+    path.push(path[0]);
+    return path;
+  };
+  const framed = sections.map(s => {
+    if (s.outlineOnly === false) return { section: s, solid: true };
+    const frame = hollow(s);
+    return frame
+      ? { section: { ...s, coordinates: [frame], display_point: s.display_point }, solid: false }
+      : { section: s, solid: true };
+  });
   const twinUnitId = id => {
     const base = String(id || randomUUID());
     const tail = base.slice(24).split('').map(c => {
@@ -673,13 +740,13 @@ function generateIMDFFiles(projectData) {
     type: 'FeatureCollection',
     features: [
       ...roomUnits.map(u => drawnFeature(u, 'unit')),
-      ...sections.map(s => drawnFeature({ ...s, id: twinUnitId(s.id), placeId: null }, 'unit'))
+      ...framed.filter(f => f.solid).map(f => drawnFeature({ ...f.section, id: twinUnitId(f.section.id), placeId: null }, 'unit'))
     ]
   };
 
   const sectionFeatures = {
     type: 'FeatureCollection',
-    features: sections.map(s => drawnFeature(s, 'section'))
+    features: framed.map(f => drawnFeature(f.section, 'section'))
   };
 
   // Fixture geometry. IMDF fixtures are polygons: furniture traced by the
@@ -766,6 +833,96 @@ function generateIMDFFiles(projectData) {
 
   unitFeatures.features.push(...furnitureUnitFeatures);
 
+  // Features that exist only to be drawn (furniture, 3D walls): nothing in
+  // the Places directory maps to them, so they stay out of mapfeatures.csv.
+  const decorIds = new Set(furnitureUnitFeatures.map(f => f.id));
+
+  // Optional 3D effect. Places draws flat polygons in one fill colour, so
+  // depth has to come from geometry: every wall — whatever part of the
+  // footprint no floor unit covers, doorways excepted — is raised, as if the
+  // map were seen from the south at a steep angle. Its top is drawn a little
+  // further north than its base and the south face in between is hatched
+  // (thin slivers whose outlines read as shading). These go last in the file
+  // so they are painted over the floors and furniture they would hide.
+  if (options.effect3d) {
+    const wallHeight = Number(options.wallHeightMeters) > 0 ? Number(options.wallHeightMeters) : 0.35;
+    const height = wallHeight / metersPerUnit;       // canvas units; canvas y grows southward
+    const doorReach = 0.45 / metersPerUnit;
+    const hatchStep = 0.075 / metersPerUnit;
+    const openRing = ring => {
+      const last = ring[ring.length - 1];
+      return (ring[0][0] === last[0] && ring[0][1] === last[1]) ? ring.slice(0, -1) : ring;
+    };
+    // Without a traced outline the units' own bounding box stands in (not
+    // the padded footprint, whose margin would become one thick wall).
+    const footprintRing = outlineRing
+      ? openRing(outlineRing)
+      : [[minX, minY], [maxX, minY], [maxX, maxY], [minX, maxY]];
+    // Stable ids, so re-exports don't churn.
+    const decorId = (levelId, tag, i) => {
+      const hex = createHash('sha1').update(`${buildingId}|${levelId}|${tag}|${i}`).digest('hex');
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+    };
+    const decorFeature = (ring, id, levelId, name, category) => {
+      const rings = projectPolygon([closeRing(ring)]);
+      decorIds.add(id);
+      return {
+        type: 'Feature',
+        id,
+        feature_type: 'unit',
+        geometry: { type: 'Polygon', coordinates: rings },
+        properties: {
+          category,
+          restriction: null,
+          name: toLabels(name),
+          alt_name: null,
+          display_point: { type: 'Point', coordinates: ringCentroid(rings[0]) },
+          level_id: levelId
+        }
+      };
+    };
+    const fpBox = MapGeom.ringBounds(footprintRing);
+    const thresholds = [];
+    for (const level of levels) {
+      const floors = roomUnits
+        .filter(u => u.levelId === level.id && Array.isArray(u.coordinates?.[0]))
+        .map(u => [openRing(u.coordinates[0])]);
+      if (!floors.length) continue;
+      const doorways = openings
+        .filter(o => o.levelId === level.id && Array.isArray(o.coordinates) && o.coordinates.length >= 2)
+        .map(o => {
+          const [x1, y1] = o.coordinates[0];
+          const [x2, y2] = o.coordinates[o.coordinates.length - 1];
+          const box = Math.abs(x2 - x1) >= Math.abs(y2 - y1)
+            ? { x0: Math.min(x1, x2), x1: Math.max(x1, x2), y0: (y1 + y2) / 2 - doorReach, y1: (y1 + y2) / 2 + doorReach }
+            : { x0: (x1 + x2) / 2 - doorReach, x1: (x1 + x2) / 2 + doorReach, y0: Math.min(y1, y2), y1: Math.max(y1, y2) };
+          // An entrance opens the outer wall but stays inside the outline.
+          return {
+            x0: Math.max(box.x0, fpBox.minX), x1: Math.min(box.x1, fpBox.maxX),
+            y0: Math.max(box.y0, fpBox.minY), y1: Math.min(box.y1, fpBox.maxY)
+          };
+        })
+        .filter(d => d.x1 > d.x0 && d.y1 > d.y0);
+      const { tops, faces } = MapGeom.extrudeWalls(footprintRing, floors, doorways, height);
+      // The doorways themselves are floor: without a unit they would show
+      // the blank background.
+      doorways.forEach((d, i) => thresholds.push(decorFeature(
+        [[d.x0, d.y0], [d.x1, d.y0], [d.x1, d.y1], [d.x0, d.y1]],
+        decorId(level.id, 'doorway', i), level.id, 'Doorway', 'walkway')));
+      let hatch = 0;
+      faces.forEach((ring, i) => {
+        unitFeatures.features.push(decorFeature(ring, decorId(level.id, 'face', i), level.id, 'Wall', 'unspecified'));
+        for (const sliver of MapGeom.hatchRing(ring, hatchStep, hatchStep * 0.3)) {
+          unitFeatures.features.push(decorFeature(sliver, decorId(level.id, 'hatch', hatch++), level.id, 'Wall', 'unspecified'));
+        }
+      });
+      tops.forEach((ring, i) => {
+        unitFeatures.features.push(decorFeature(ring, decorId(level.id, 'top', i), level.id, 'Wall', 'unspecified'));
+      });
+    }
+    unitFeatures.features.unshift(...thresholds);
+  }
+
   const fixtureFeatures = {
     type: 'FeatureCollection',
     features: deskFixtures.map(fixture => ({
@@ -803,6 +960,8 @@ function generateIMDFFiles(projectData) {
   }
 
   validatePlacesCompatibility(files);
+  // Non-enumerable: travels with the package without becoming a file in it.
+  Object.defineProperty(files, 'decorIds', { value: decorIds });
   return files;
 }
 
@@ -908,18 +1067,16 @@ function generateMapFeaturesCSV(projectData) {
     return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
   };
 
-  // Furniture rides in unit.geojson purely for rendering (Places draws
-  // polygons only for units) — keep those rows out of the correlation CSV,
-  // which the user edits by hand; nothing in the directory maps to them.
-  const furnitureIds = new Set((projectData.fixtures || [])
-    .filter(f => (f.category || 'furniture') !== 'desk' && !f.placeId)
-    .map(f => f.id));
+  // Furniture and 3D walls ride in unit.geojson purely for rendering (Places
+  // draws polygons only for units) — keep those rows out of the correlation
+  // CSV, which the user edits by hand; nothing in the directory maps to them.
+  const decorIds = files.decorIds;
 
   const rows = [['PlaceId', 'Name', 'Type', 'FeatureType', 'FeatureId', 'FeatureName', 'FeatureCategory']];
   for (const filename of ['building.geojson', 'level.geojson', 'unit.geojson', 'section.geojson', 'fixture.geojson']) {
     if (!files[filename]) continue;
     for (const feature of files[filename].features) {
-      if (filename === 'unit.geojson' && furnitureIds.has(feature.id)) continue;
+      if (filename === 'unit.geojson' && decorIds.has(feature.id)) continue;
       const featureName = feature.properties.name?.en || '';
       const placeId = placeIdsByFeatureId.get(feature.id) || '';
       rows.push([
@@ -952,9 +1109,13 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });
 
-// Start server
-ensureDirectories().then(() => {
-  app.listen(PORT, () => {
-    console.log(`IMDF Builder server running on http://localhost:${PORT}`);
+// Start server (unless loaded as a module, e.g. by a test script)
+if (require.main === module) {
+  ensureDirectories().then(() => {
+    app.listen(PORT, () => {
+      console.log(`IMDF Builder server running on http://localhost:${PORT}`);
+    });
   });
-});
+}
+
+module.exports = { app, generateIMDFFiles, generateMapFeaturesCSV };

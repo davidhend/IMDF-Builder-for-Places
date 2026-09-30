@@ -13,14 +13,16 @@ built on Fabric.js. Not a Home Assistant component.
 
 - `server.js` — Express entrypoint.
 - `public/` — frontend: `index.html`, `css/styles.css`, `js/app.js` (the editor),
-  and **`lib/fabric.min.js`** (vendored third-party — don't hand-edit or "tidy").
+  `js/autotrace.js` (floor plan → vector geometry, DOM-free), `js/mapgeom.js`
+  (geometry helpers, also `require`d by `server.js`), and **`lib/fabric.min.js`**
+  (vendored third-party — don't hand-edit or "tidy").
 - `Dockerfile`, `docker-compose.yml`, `package.json` (+ lock).
 - `.github/workflows/docker-publish.yml` — builds + publishes the image.
 
 ## Conventions
 
 - Node web app: no `manifest.json`/`hassfest`/HACS.
-- Your code is `server.js` + `public/css` + `public/js/app.js`; leave the vendored
+- Your code is `server.js` + `public/css` + `public/js/*.js`; leave the vendored
   `public/lib/` alone.
 - JS deps via npm; commit `package-lock.json`. CI publishes the image.
 - Any Apple/MapKit credentials or API keys are config via env — never commit them.

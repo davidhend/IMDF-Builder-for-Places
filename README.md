@@ -8,9 +8,11 @@ This is a fork of [loryanstrant/IMDF-Builder-for-Places](https://github.com/lory
 
 - **Places-compatible export**: packages match the undocumented subset of IMDF that `Import-MapCorrelations` / `New-Map` accept (localized name dicts, null building geometry, exact property names, allowlisted files only). The exporter validates every package before download and reports real problems clearly instead of Places' misleading errors.
 - **Streamlined import workflow**: enter PlaceIds in the UI (with paste/typo validation) and the export includes a pre-correlated `mapfeatures.csv`, so the `Import-MapCorrelations` extract pass isn't needed.
-- **Auto-Trace Rooms**: detects rooms, the building outline, walls, and free-standing furniture from the uploaded floor plan using geometric wall detection. Seals door openings so real CAD plans trace cleanly, works at any page margin/scale, and every detected shape stays editable.
-- **Full-floor partition**: auto-trace also covers the leftover circulation space with `walkway` units — corridors, lobbies, open areas — so the whole floor renders like professionally built Places maps, with walls appearing as the gaps between units. Walkways that wrap around room blocks are split into simple polygons at export (Places' importer fails on polygons with holes).
-- **Recognisable furniture**: furniture clusters are decomposed into clean rectangles — a conference table with its chairs exports as one table and individual chairs instead of a single traced blob — and free-standing cubicle banks are traced with their cells kept open so cubicle outlines show on the map.
+- **Auto-Trace Rooms**: turns the uploaded floor plan into clean vector geometry rather than pixel outlines — Places draws every unit in one flat fill with a thin outline, so the map only looks as good as its shapes. Walls are found geometrically and rooms are straightened onto their wall lines (rectangles and L-shapes, not wobbly traces); the building outline drops facade detail smaller than ~1.5 m, so a rectangular building comes out as a plain box. Doors are recognised by their swing arcs, sealed, and erased; dashed lines (soffits, canopies, property lines) are ignored; spaces too small to be rooms (toilet stalls, closets) merge into their neighbour. Works at any page margin/scale, and every detected shape stays editable.
+- **Full-floor partition**: auto-trace also covers the circulation space with `walkway` units — corridors, lobbies, open areas — so the whole floor renders like professionally built Places maps, with walls appearing as the gaps between units. Walkways that wrap around room blocks are split into simple polygons at export (Places' importer fails on polygons with holes).
+- **Furniture that matches the drawing**: furniture is rebuilt from the shapes its line-work encloses — every desktop, return, table and chair seat becomes its own fitted shape (rectangle, rounded rectangle, chamfered polygon), and each chair around a conference table gets its own outline — so offices show their desks and chairs as drawn, crisp at any zoom. Cubicle panels and partitions export as thin straight strokes.
+- **Places preview**: a "Preview as Places" view draws the export the way Places does (one fill, near-white walkways, thin outlines, file-order painting), so a map can be judged in seconds instead of after an import.
+- **3D effect (optional)**: an export option that raises the walls — each wall's top is drawn slightly north of its base with a hatched south face, and doorways are left open — giving the flat Places map a sense of depth using nothing but ordinary unit polygons.
 - **Bookable desk support**: sections (desk pools) with visible outlines, and furniture exported so it actually renders in Places, including auto-drawn desk icons with rotation.
 - **Real-world scaling**: exports are scaled to the building's physical width, with pixel metrics and exact geometry entry for precise shapes.
 - **Categories aligned with Places**: the workplace set (`conferenceroom`, `workspace`, `desk`) plus space categories (`walkway`, `lobby`, `lounge`, `kitchen`, `foodservice`, `phoneroom`, `mothersroom`, `nonpublic`, `storage`, …), with a Places-style colour preview in the editor so the canvas approximates how the imported map will look.
@@ -22,7 +24,9 @@ This is a fork of [loryanstrant/IMDF-Builder-for-Places](https://github.com/lory
 ## Features
 
 - 🖼️ **Floor Plan Upload**: Upload PDF or image files of your floor plans
-- 🪄 **Auto-Trace Rooms**: Automatically detect rooms, walkways, the building outline, cubicle banks, and furniture from the floor plan — the whole floor is partitioned into units, furniture is decomposed into clean table/chair/desk rectangles, and everything stays editable afterwards
+- 🪄 **Auto-Trace Rooms**: Automatically detect rooms, walkways, doorways, the building outline, cubicle panels, and furniture from the floor plan — rooms come out as clean straight-edged shapes, furniture as fitted desk/table/chair shapes, and everything stays editable afterwards
+- 👁️ **Places Preview**: See how the export will look in Microsoft Places before importing it
+- 🧊 **3D Effect**: Optionally export raised walls with shaded faces and open doorways
 - 🏢 **Interactive Editor**: Visual canvas-based editor for placing indoor mapping elements
 - 🎨 **Category Colours**: every unit previews in a Places-like tint (walkway, workspace, conference room, kitchen, non-public, …) so the canvas approximates the imported map
 - 📍 **IMDF Elements Support**:
@@ -145,14 +149,14 @@ docker run -d -p 3009:3009 -v $(pwd)/projects:/app/projects -v $(pwd)/uploads:/a
 
 ### Step 4: Place Items on the Floor Plan
 
-The fastest way to start is **Auto-Trace Rooms**: it detects rooms (wall-following shapes), the building outline, walkway units covering the leftover circulation space (so the whole floor renders like a professionally built Places map, walls showing as the gaps between units), free-standing cubicle banks (traced with their cells kept open), and furniture decomposed into clean table/chair/desk rectangles. Every detected shape can be moved, resized, renamed, or deleted afterwards.
+The fastest way to start is **Auto-Trace Rooms**: it detects rooms (straightened onto their wall lines), the building outline (facade detail smaller than ~1.5 m is dropped, so a rectangular building becomes a plain box), walkway units covering the circulation space (so the whole floor renders like a professionally built Places map, walls showing as the gaps between units), doorways (added as openings), cubicle panels and partitions, and furniture rebuilt as fitted desk, table and chair shapes. Dashed lines on the plan are ignored. Every detected shape can be moved, resized, renamed, or deleted afterwards, and the trace can be re-run: shapes that already exist are left alone.
 
 After tracing, set each room's category (restroom, conference room, kitchen, …) in its properties — Places tints rooms by category and draws icons for restrooms, elevators, and stairs.
 
 To place items manually (or adjust after auto-tracing):
 1. Select a tool from the "Place Items" section:
    - **Place Unit**: For rooms, offices, conference rooms
-   - **Place Section**: For desk pools — the area a group of bookable desks sits in
+   - **Place Section**: For desk pools — the area a group of bookable desks sits in. Sections are drawn as a dashed outline with no fill, so one can cover a whole floor; click the outline to select it, and clicks inside still reach the rooms and desks beneath
    - **Place Amenity**: For desks, seating, facilities
    - **Place Fixture**: For walls, windows
    - **Place Opening**: For doors, entrances
@@ -168,9 +172,19 @@ To place items manually (or adjust after auto-tracing):
    - Update the category
 4. Click "Update Properties" to save changes
 
-### Step 6: Export IMDF Files
-1. Click the "Export IMDF Files" button in the right sidebar
-2. Two downloads are produced:
+### Step 6: Preview and Export IMDF Files
+1. Click "Preview as Places" in the right sidebar to see the map the way Places will draw it
+   (scroll to zoom, drag to pan). Places has no per-shape styling — every unit gets the same
+   fill and outline — so what you see here is what the geometry will look like.
+2. Optionally tick **3D effect (raised walls)**. Whatever part of the building outline no room
+   or walkway covers is treated as wall; each wall top is drawn a little north of its base and
+   the south face in between is hatched, as if the map were viewed at an angle. Openings
+   (doors) become gaps in the walls. "Wall height on the map" sets how far the tops are
+   shifted (0.35 m is a good start). The effect adds a few hundred small units and relies on
+   Places painting units in file order (the same behaviour that already puts furniture on top
+   of rooms) — preview it, and keep a flat export to fall back on.
+3. Click the "Export IMDF Files" button
+4. Two downloads are produced:
    - `imdf-export.zip` — the IMDF package Microsoft Places accepts:
      building.geojson, footprint.geojson, level.geojson, unit.geojson
      (plus section.geojson and fixture.geojson when sections or fixtures
@@ -205,7 +219,10 @@ The import correlates each IMDF feature to an object in the Places directory
 4. For bookable desks: desks are located through their parent Section (desk
    pool). Draw a Section over the desk area and correlate it to that Section
    object's PlaceId — without it, reserving a desk reports it couldn't be
-   located on the map. To show an individual desk, select its furniture
+   located on the map. Places paints a section as a solid fill over everything
+   beneath it, so sections export as a narrow frame along their outline by
+   default (see-through, label still centred); untick "Export as outline only"
+   in the section's properties for a solid fill. To show an individual desk, select its furniture
    shape, set the category to **Desk**, and paste the Desk object's PlaceId
    into its Places ID field (naming the shape after the directory object is
    recommended). Places then draws its own desk icon there and colours it by
@@ -243,7 +260,9 @@ IMDF-Builder-for-Places/
 │   ├── css/
 │   │   └── styles.css    # Application styles
 │   └── js/
-│       └── app.js        # Application logic
+│       ├── app.js        # Application logic (editor)
+│       ├── autotrace.js  # Floor plan → vector geometry (rooms, walls, doors, furniture)
+│       └── mapgeom.js    # Geometry helpers shared by browser and server
 ├── uploads/              # Uploaded floor plans (created at runtime)
 ├── projects/             # Saved projects (created at runtime)
 ├── package.json          # Node.js dependencies

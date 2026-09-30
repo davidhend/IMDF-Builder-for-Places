@@ -64,7 +64,7 @@
                         <button id="uploadBtn" class="btn btn-primary">Upload</button>
                     </div>
                     <div class="form-group">
-                        <button id="autoTraceBtn" class="btn btn-secondary" title="Detect rooms (wall-following shapes), the building outline, and free-standing furniture on the floor plan — all editable afterwards">Auto-Trace Rooms</button>
+                        <button id="autoTraceBtn" class="btn btn-secondary" title="Detect rooms, walkways, doorways, the building outline and furniture on the floor plan — all editable afterwards">Auto-Trace Rooms</button>
                     </div>
                 </div>
 
@@ -144,6 +144,17 @@
                         <p>Generate IMDF files compatible with Microsoft Places, plus a
                         pre-filled <code>mapfeatures.csv</code> for <code>Import-MapCorrelations</code></p>
                     </div>
+                    <div class="form-group">
+                        <label class="checkbox-row" for="effect3d" title="Raises the walls: each wall top is drawn slightly north of its base with a shaded south face, as if the map were viewed at an angle">
+                            <input type="checkbox" id="effect3d">
+                            3D effect (raised walls)
+                        </label>
+                    </div>
+                    <div class="form-group" id="wallHeightGroup" style="display: none;">
+                        <label for="wallHeight">Wall height on the map (meters):</label>
+                        <input type="number" id="wallHeight" value="0.35" min="0.1" max="1.5" step="0.05">
+                    </div>
+                    <button id="previewBtn" class="btn btn-secondary" style="width: 100%; margin-bottom: 8px;">Preview as Places</button>
                     <button id="exportBtn" class="btn btn-success">Export IMDF Files</button>
                 </div>
 
@@ -202,9 +213,9 @@
                             <li>Enter your project name and building info</li>
                             <li>Upload a floor plan image or PDF</li>
                             <li>Add at least one level</li>
-                            <li>Use the tools to place units, amenities, and other items</li>
+                            <li>Click Auto-Trace Rooms, or use the tools to place items by hand</li>
                             <li>Configure properties for each item</li>
-                            <li>Export IMDF files</li>
+                            <li>Preview as Places, then export IMDF files</li>
                         </ol>
                     </div>
                 </div>
@@ -221,6 +232,19 @@
         </div>
     </div>
 
+    <!-- Places Preview Modal -->
+    <div id="previewModal" class="modal">
+        <div class="modal-content modal-wide">
+            <span class="close" id="previewClose">&times;</span>
+            <h2>Places preview</h2>
+            <p class="hint">How this export should look in Microsoft Places (light theme): one fill for
+            rooms and furniture, near-white walkways, thin outlines. Scroll to zoom, drag to pan.</p>
+            <div class="preview-frame"><canvas id="previewCanvas"></canvas></div>
+        </div>
+    </div>
+
+    <script src="/js/mapgeom.js"></script>
+    <script src="/js/autotrace.js"></script>
     <script src="/js/app.js"></script>
 </body>
 </html>

@@ -405,6 +405,40 @@ header h1 {
     box-shadow: 0 4px 6px var(--shadow);
 }
 
+.modal-wide {
+    margin: 3vh auto;
+    width: 92%;
+    max-width: 1100px;
+}
+
+/* Always light: this mimics Places' light-theme map, whatever the app theme. */
+.preview-frame {
+    height: 76vh;
+    background: #ffffff;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.preview-frame canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: grab;
+}
+
+.checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+}
+
+.checkbox-row input {
+    width: auto;
+    margin: 0;
+}
+
 .close {
     color: var(--text-muted);
     float: right;
