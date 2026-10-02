@@ -30,7 +30,13 @@ const projectLimiter = rateLimit({
 // Middleware
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-app.use(express.static('public'));
+// Always revalidate the app's own files, so a rebuilt container shows up
+// on the next ordinary reload (no hard refresh, no stale styles.css next to
+// a fresh app.js).
+app.use(express.static('public', {
+  etag: true,
+  setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache')
+}));
 
 // Create directories if they don't exist
 const ensureDirectories = async () => {
