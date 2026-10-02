@@ -16,7 +16,8 @@ This is a fork of [loryanstrant/IMDF-Builder-for-Places](https://github.com/lory
 - **Bookable desk support**: sections (desk pools) with visible outlines, and furniture exported so it actually renders in Places, including auto-drawn desk icons with rotation.
 - **Real-world scaling**: exports are scaled to the building's physical width, with pixel metrics and exact geometry entry for precise shapes.
 - **Categories aligned with Places**: the workplace set (`conferenceroom`, `workspace`, `desk`) plus space categories (`walkway`, `lobby`, `lounge`, `kitchen`, `foodservice`, `phoneroom`, `mothersroom`, `nonpublic`, `storage`, …), with a Places-style colour preview in the editor so the canvas approximates how the imported map will look.
-- **Editor improvements**: Alt+click cycles through overlapping shapes, and shape positions are restored correctly when loading a saved project.
+- **Re-trace without losing work**: running Auto-Trace on a level that already has shapes offers to rebuild it — rooms that line up with existing ones keep their names, categories and Places IDs, so correlations survive an upgrade of the tracer.
+- **Editor improvements**: zoom keeps the view centred; sections are a see-through dashed outline that can cover a whole floor without blocking what is beneath; Alt+click cycles through overlapping shapes; status messages are brief corner notices instead of pop-ups that must be dismissed; shape positions are restored correctly when loading a saved project.
 - **Fixes**: startup crash (#9), floor plans not rendering (#4), and a multer security bump (CVE-2026-5038, CVE-2026-5079).
 
 > **Note:** the pre-built `ghcr.io/loryanstrant/imdf-builder-for-places` Docker image is built from the upstream repository and does **not** include these changes. To run this fork, use the local install instructions or build the Docker image locally (`build: .` in `docker-compose.yml`).
@@ -40,6 +41,7 @@ This is a fork of [loryanstrant/IMDF-Builder-for-Places](https://github.com/lory
 - 💾 **Project Management**: Save and load projects for later editing
 - 📦 **Export**: Generate complete, Places-validated IMDF packages plus a pre-correlated `mapfeatures.csv`
 - 🌓 **Dark Mode**: Toggle in the header; remembers your choice and follows your OS preference
+- 🔔 **Quiet notifications**: Saves, updates and exports report in a corner notice that fades on its own
 - 🐳 **Docker Support**: Easy deployment with Docker and Docker Compose
 
 
@@ -66,6 +68,9 @@ The easiest way to run the application is using the pre-built Docker image from 
 
    # The application will be available at http://localhost:3009
    ```
+
+   After rebuilding, a normal page reload picks up the new version (the app's files are served with
+   `Cache-Control: no-cache`, so the browser re-checks them).
 
 3. **Stop the Application**
    ```bash
@@ -149,7 +154,7 @@ docker run -d -p 3009:3009 -v $(pwd)/projects:/app/projects -v $(pwd)/uploads:/a
 
 ### Step 4: Place Items on the Floor Plan
 
-The fastest way to start is **Auto-Trace Rooms**: it detects rooms (straightened onto their wall lines), the building outline (facade detail smaller than ~1.5 m is dropped, so a rectangular building becomes a plain box), walkway units covering the circulation space (so the whole floor renders like a professionally built Places map, walls showing as the gaps between units), doorways (added as openings), cubicle panels and partitions, and furniture rebuilt as fitted desk, table and chair shapes. Dashed lines on the plan are ignored. Every detected shape can be moved, resized, renamed, or deleted afterwards, and the trace can be re-run: shapes that already exist are left alone.
+The fastest way to start is **Auto-Trace Rooms**: it detects rooms (straightened onto their wall lines), the building outline (facade detail smaller than ~1.5 m is dropped, so a rectangular building becomes a plain box), walkway units covering the circulation space (so the whole floor renders like a professionally built Places map, walls showing as the gaps between units), doorways (added as openings), cubicle panels and partitions, and furniture rebuilt as fitted desk, table and chair shapes. Dashed lines on the plan are ignored. Every detected shape can be moved, resized, renamed, or deleted afterwards. Running it again on a level that already has shapes asks whether to rebuild the level (rooms that line up with existing ones keep their name, category and Places ID; walkways, furniture and doorways are redrawn) or only add what is missing.
 
 After tracing, set each room's category (restroom, conference room, kitchen, …) in its properties — Places tints rooms by category and draws icons for restrooms, elevators, and stairs.
 
