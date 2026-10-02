@@ -232,7 +232,7 @@ class IMDFBuilder {
     handleCanvasClick(event) {
         if (!event.pointer || this.currentTool === 'select') return;
         if (!this.currentLevel) {
-            alert('Please add and select a level first');
+            this.notify('Please add and select a level first', 'warning');
             return;
         }
 
@@ -594,16 +594,16 @@ class IMDFBuilder {
                 this.canvas.renderAll();
                 this.showObjectMetrics(data.fabricObject);
             } else {
-                alert('Position/size values must be numbers (width and height above 0) — geometry not changed.');
+                this.notify('Position/size values must be numbers (width and height above 0) — geometry not changed.', 'warning');
             }
         }
 
-        alert('Properties updated!');
+        this.notify('Properties updated!', 'success');
     }
 
     deleteSelected() {
         if (!this.selectedObject) {
-            alert('No object selected');
+            this.notify('No object selected', 'warning');
             return;
         }
 
@@ -707,7 +707,7 @@ class IMDFBuilder {
             document.getElementById('level-prop-placeid').value = level.placeId || '';
             this.renderLevelsList();
             this.updateCanvasInfo(`Current Level: ${level.name}`);
-            alert('Level updated!');
+            this.notify('Level updated!', 'success');
         });
     }
 
@@ -749,12 +749,12 @@ class IMDFBuilder {
     // correlations survive a re-trace.
     autoTraceRooms() {
         if (!this.currentLevel) {
-            alert('Please add and select a level first');
+            this.notify('Please add and select a level first', 'warning');
             return;
         }
         const bg = this.canvas.backgroundImage;
         if (!bg) {
-            alert('Upload a floor plan first — auto-trace scans the background image.');
+            this.notify('Upload a floor plan first — auto-trace scans the background image.', 'warning');
             return;
         }
         const el = bg.getElement ? bg.getElement() : bg._element;
@@ -773,7 +773,7 @@ class IMDFBuilder {
             }
         });
         if (!result) {
-            alert('No drawing was detected on the floor plan image.');
+            this.notify('No drawing was detected on the floor plan image.', 'warning');
             return;
         }
 
@@ -980,15 +980,15 @@ class IMDFBuilder {
         this.canvas.renderAll();
         this.updateCounts();
         if (rooms === 0 && updated === 0 && furniture === 0 && walkways === 0) {
-            alert('No enclosed rooms were detected. Rooms already covered by existing boxes are left alone; otherwise try drawing manually.');
+            this.notify('No enclosed rooms were detected. Rooms already covered by existing boxes are left alone; otherwise try drawing manually.', 'warning');
         } else {
-            alert(`Auto-trace added ${rooms} room(s)` +
+            this.notify(`Auto-trace added ${rooms} room(s)` +
                   (updated ? `, redrew ${updated} existing room(s) in place` : '') +
                   (walkways ? `, ${walkways} walkway area(s) covering the circulation space` : '') +
                   (furniture ? `, ${furniture} furniture piece(s)` : '') +
                   (doors ? `, ${doors} doorway(s)` : '') +
                   ', and the building outline (exported as the footprint)' +
-                  '. Move, resize, rename, or delete any shape afterwards — set each room’s category so Places tints it correctly.');
+                  '. Move, resize, rename, or delete any shape afterwards — set each room’s category so Places tints it correctly.', 'info', 12000);
         }
     }
 
@@ -1015,7 +1015,7 @@ class IMDFBuilder {
         const file = fileInput.files[0];
         
         if (!file) {
-            alert('Please select a file first');
+            this.notify('Please select a file first', 'warning');
             return;
         }
 
@@ -1033,12 +1033,12 @@ class IMDFBuilder {
             if (response.ok && result.success) {
                 this.floorplanImage = result.path;
                 await this.loadFloorplanToCanvas(result.path);
-                alert('Floor plan uploaded successfully!');
+                this.notify('Floor plan uploaded successfully!', 'success');
             } else {
-                alert('Upload failed: ' + (result.error || `HTTP ${response.status}`));
+                this.notify('Upload failed: ' + (result.error || `HTTP ${response.status}`), 'warning');
             }
         } catch (error) {
-            alert('Upload error: ' + error.message);
+            this.notify('Upload error: ' + error.message, 'warning');
         }
     }
 
@@ -1235,12 +1235,12 @@ class IMDFBuilder {
             
             if (result.success) {
                 this.projectId = result.projectId;
-                alert('Project saved successfully!');
+                this.notify('Project saved successfully!', 'success');
             } else {
-                alert('Save failed: ' + result.error);
+                this.notify('Save failed: ' + result.error, 'warning');
             }
         } catch (error) {
-            alert('Save error: ' + error.message);
+            this.notify('Save error: ' + error.message, 'warning');
         }
     }
 
@@ -1269,7 +1269,7 @@ class IMDFBuilder {
 
             document.getElementById('loadProjectModal').style.display = 'block';
         } catch (error) {
-            alert('Error loading projects: ' + error.message);
+            this.notify('Error loading projects: ' + error.message, 'warning');
         }
     }
 
@@ -1392,9 +1392,9 @@ class IMDFBuilder {
 
             this.updateCounts();
             document.getElementById('loadProjectModal').style.display = 'none';
-            alert('Project loaded successfully!');
+            this.notify('Project loaded successfully!', 'success');
         } catch (error) {
-            alert('Error loading project: ' + error.message);
+            this.notify('Error loading project: ' + error.message, 'warning');
         }
     }
 
@@ -1441,7 +1441,7 @@ class IMDFBuilder {
 
             if (!response.ok) {
                 const result = await this.parseJsonResponse(response);
-                alert('Export failed: ' + (result.error || `HTTP ${response.status}`));
+                this.notify('Export failed: ' + (result.error || `HTTP ${response.status}`), 'warning');
                 return;
             }
             this.downloadBlob(await response.blob(), 'imdf-export.zip');
@@ -1457,9 +1457,9 @@ class IMDFBuilder {
                 this.downloadBlob(await csvResponse.blob(), 'mapfeatures.csv');
             }
 
-            alert('IMDF files exported successfully!');
+            this.notify('IMDF files exported successfully!', 'success');
         } catch (error) {
-            alert('Export error: ' + error.message);
+            this.notify('Export error: ' + error.message, 'warning');
         }
     }
 
@@ -1479,12 +1479,12 @@ class IMDFBuilder {
             });
             const result = await this.parseJsonResponse(response);
             if (!response.ok) {
-                alert('Preview failed: ' + (result.error || `HTTP ${response.status}`));
+                this.notify('Preview failed: ' + (result.error || `HTTP ${response.status}`), 'warning');
                 return;
             }
             files = result.files;
         } catch (error) {
-            alert('Preview error: ' + error.message);
+            this.notify('Preview error: ' + error.message, 'warning');
             return;
         }
 
@@ -1598,6 +1598,32 @@ class IMDFBuilder {
         canvas.onmouseup = canvas.onmouseleave = () => { drag = null; };
     }
 
+    // Transient notice in the corner of the window instead of a modal
+    // alert: it says what happened and goes away on its own (or on click),
+    // so nothing has to be dismissed before carrying on. Warnings linger a
+    // little longer; a long summary can ask for more time.
+    notify(message, kind, duration) {
+        let stack = document.getElementById('toasts');
+        if (!stack) {
+            stack = document.createElement('div');
+            stack.id = 'toasts';
+            document.body.appendChild(stack);
+        }
+        const toast = document.createElement('div');
+        toast.className = `toast toast-${kind || 'success'}`;
+        toast.textContent = message;
+        toast.title = 'Click to dismiss';
+        const dismiss = () => {
+            if (!toast.parentNode) return;
+            toast.classList.add('toast-leaving');
+            setTimeout(() => toast.remove(), 250);
+        };
+        toast.addEventListener('click', dismiss);
+        stack.appendChild(toast);
+        while (stack.children.length > 4) stack.firstChild.remove();
+        setTimeout(dismiss, duration || (kind === 'warning' ? 7000 : 3500));
+    }
+
     downloadBlob(blob, filename) {
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -1696,7 +1722,7 @@ class IMDFBuilder {
         if (!trimmed) return null;
         const guids = trimmed.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || [];
         if (guids.length !== 1) {
-            alert(`${label}: "${trimmed}" doesn't contain exactly one PlaceId GUID (like 7b52c3f3-6700-4c58-89cc-e7934bfab853). The value was not saved.`);
+            this.notify(`${label}: "${trimmed}" doesn't contain exactly one PlaceId GUID (like 7b52c3f3-6700-4c58-89cc-e7934bfab853). The value was not saved.`, 'warning');
             return null;
         }
         return guids[0].toLowerCase();
